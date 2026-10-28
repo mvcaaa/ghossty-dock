@@ -6487,10 +6487,10 @@ index 0000000..2b66815
 +}
 diff --git a/macos/Sources/Features/Dock/DockSessions.swift b/macos/Sources/Features/Dock/DockSessions.swift
 new file mode 100644
-index 0000000..0ceac12
+index 0000000..3d20550
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSessions.swift
-@@ -0,0 +1,1576 @@
+@@ -0,0 +1,1611 @@
 +import AppKit
 +import Combine
 +import UserNotifications
@@ -7103,6 +7103,20 @@ index 0000000..0ceac12
 +        var project: String?
 +        var prompt: String?
 +        var ask: DockAsk?
++        var transcript: String?
++    }
++
++    private var titles: [String: DockTitles] = [:]
++
++    private func titles(_ path: String?) -> DockTitles? {
++        guard let path, let t = DockTitles.read(path, after: titles[path]) else { return nil }
++        titles[path] = t
++        return t
++    }
++
++    /// Whether `s` is the session a tab titled `title` is showing.
++    private func shows(_ s: Session, _ title: String) -> Bool {
++        titles(s.transcript)?.shown(in: title) ?? false
 +    }
 +
 +    /// The creation date of session <id>'s transcript, in any project folder.
@@ -7332,16 +7346,25 @@ index 0000000..0ceac12
 +
 +    func refresh() {
 +        var sessions: [String: Session] = [:]
++        // Sessions with no tab of their own (background sessions in Claude
++        // Code's daemon), shown by whichever tab's title names them.
++        var detached: [Session] = []
 +        let files = (try? FileManager.default.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
-+        for url in files where url.lastPathComponent.hasPrefix("srf-") && url.pathExtension == "json" {
-+            guard let data = try? Data(contentsOf: url),
++        for url in files where url.pathExtension == "json" {
++            let file = url.lastPathComponent
++            guard file.hasPrefix("srf-") || file.hasPrefix("sid-"),
++                  let data = try? Data(contentsOf: url),
 +                  let s = try? JSONDecoder().decode(Session.self, from: data) else { continue }
 +            if let pid = s.claude_pid, kill(pid, 0) != 0, errno != EPERM {
 +                // claude went away without a SessionEnd (closed tab, crash).
 +                try? FileManager.default.removeItem(at: url)
 +                continue
 +            }
-+            sessions[String(url.deletingPathExtension().lastPathComponent.dropFirst(4))] = s
++            if file.hasPrefix("srf-") {
++                sessions[String(url.deletingPathExtension().lastPathComponent.dropFirst(4))] = s
++            } else {
++                detached.append(s)
++            }
 +        }
 +
 +        let now = Int(Date().timeIntervalSince1970)
@@ -7360,12 +7383,7 @@ index 0000000..0ceac12
 +            let selected = isSelectedTab && (window.isKeyWindow || window.isMainWindow)
 +            let onScreen = appActive && selected
 +
-+            // A tab with splits is one row: its most urgent session.
-+            var best: (status: Status, since: Int, name: String, key: String, sid: String?,
-+                       project: String?, prompt: String?, pid: Int32?, ask: DockAsk?)?
-+            for surface in controller.surfaceTree {
-+                let key = surface.id.uuidString
-+                guard let s = sessions[key] else { continue }
++            func status(of s: Session, seenKey key: String) -> Status {
 +                var status: Status
 +                let sid = s.session_id.flatMap { $0.isEmpty ? nil : $0 }
 +                if let sid, s.status == "running" || s.status == "waiting" { busyNow[sid] = s.since }
@@ -7385,15 +7403,41 @@ index 0000000..0ceac12
 +                    saveSeen()
 +                    status = .idle
 +                }
-+                if best == nil || status < best!.status {
-+                    best = (status, s.since, s.name, key, s.session_id.flatMap { $0.isEmpty ? nil : $0 },
-+                            s.project, s.prompt, s.claude_pid, s.ask)
-+                }
++                return status
 +            }
 +
 +            let focused = controller.focusedSurface ?? controller.surfaceTree.first
 +            let failed = controller.surfaceTree.contains { $0.error != nil }
-+            let title = cleanTitle(window.title)
++            let title = dockCleanTitle(focused?.title ?? window.title)
++
++            // A tab with splits is one row: its most urgent session.
++            var best: (status: Status, since: Int, name: String, key: String, sid: String?,
++                       project: String?, prompt: String?, pid: Int32?, ask: DockAsk?)?
++            var own: Session?
++            for surface in controller.surfaceTree {
++                let key = surface.id.uuidString
++                guard let s = sessions[key] else { continue }
++                let status = status(of: s, seenKey: key)
++                if best == nil || status < best!.status {
++                    let name = DockTitles.ownName(titles(s.transcript), title: title,
++                                                  focused: surface === focused, fallback: s.name)
++                    best = (status, s.since, name, key, s.session_id.flatMap { $0.isEmpty ? nil : $0 },
++                            s.project, s.prompt, s.claude_pid, s.ask)
++                    own = s
++                }
++            }
++
++            // Claude Code titles the tab after the session on screen. When that
++            // is not the tab's own session (the agent view showing a background
++            // session), the row follows the one on screen. Answers to its
++            // questions go to this tab, where it is shown.
++            if !title.isEmpty, own.map({ !shows($0, title) }) ?? true,
++               let s = detached.filter({ shows($0, title) }).max(by: { $0.since < $1.since }),
++               let sid = s.session_id, !sid.isEmpty, let focused {
++                let name = titles(s.transcript)?.chosen ?? title
++                best = (status(of: s, seenKey: "sid-" + sid), s.since, name, focused.id.uuidString, sid,
++                        s.project, s.prompt, s.claude_pid, s.ask)
++            }
 +            let pwd = focused?.pwd ?? (failed ? focused?.startConfig?.workingDirectory : nil) ?? ""
 +            let name = best?.name.isEmpty == false ? best!.name
 +                : !title.isEmpty ? title
@@ -8056,15 +8100,6 @@ index 0000000..0ceac12
 +        src.setCancelHandler { close(fd) }
 +        src.resume()
 +        watcher = src
-+    }
-+
-+    /// Drops the leading status glyph Claude Code puts in titles.
-+    private func cleanTitle(_ title: String) -> String {
-+        var s = Substring(title)
-+        while let c = s.first, !(c.isLetter || c.isNumber || c == "/" || c == "~" || c == "." || c == "_") {
-+            s = s.dropFirst()
-+        }
-+        return s.trimmingCharacters(in: .whitespaces)
 +    }
 +}
 diff --git a/macos/Sources/Features/Dock/DockSettings.swift b/macos/Sources/Features/Dock/DockSettings.swift
@@ -10535,6 +10570,83 @@ index 0000000..0af6f7f
 +        ghostty_config_finalize(cfg)
 +        return cfg
 +    }
++}
+diff --git a/macos/Sources/Features/Dock/DockTitles.swift b/macos/Sources/Features/Dock/DockTitles.swift
+new file mode 100644
+index 0000000..3fe414c
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockTitles.swift
+@@ -0,0 +1,71 @@
++import Foundation
++
++/// The names a transcript has given its session so far: what Claude Code
++/// puts in the terminal title. Read as the file grows, from where the last
++/// read stopped.
++struct DockTitles: Equatable {
++    var offset: UInt64 = 0
++    var custom: String?
++    var agent: String?
++    var ai: String?
++    var all: [String] { [custom, agent, ai].compactMap { $0 } }
++    var chosen: String? { custom ?? agent }
++
++    /// `previous` updated with what the transcript at `path` gained since.
++    /// Nil when there is no transcript yet.
++    static func read(_ path: String, after previous: DockTitles?) -> DockTitles? {
++        guard let h = FileHandle(forReadingAtPath: path) else { return nil }
++        defer { try? h.close() }
++        var t = previous ?? DockTitles()
++        let size = (try? h.seekToEnd()) ?? 0
++        if size < t.offset { t = DockTitles() }
++        if size > t.offset {
++            try? h.seek(toOffset: t.offset)
++            t.take((try? h.readToEnd()) ?? Data())
++        }
++        return t
++    }
++
++    /// Takes in `data`, the transcript from `offset` on. Only whole lines; a
++    /// line still being written is read next time.
++    mutating func take(_ data: Data) {
++        guard let end = data.lastIndex(of: UInt8(ascii: "\n")) else { return }
++        for line in data[..<end].split(separator: UInt8(ascii: "\n")) where line.count < 4096 {
++            guard let text = String(data: line, encoding: .utf8),
++                  text.contains("\"custom-title\"") || text.contains("\"agent-name\"")
++                    || text.contains("\"ai-title\""),
++                  let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
++            else { continue }
++            switch o["type"] as? String {
++            case "custom-title": custom = (o["customTitle"] as? String) ?? custom
++            case "agent-name": agent = (o["agentName"] as? String) ?? agent
++            case "ai-title": ai = (o["aiTitle"] as? String) ?? ai
++            default: break
++            }
++        }
++        offset += UInt64(end - data.startIndex + 1)
++    }
++
++    /// Whether a tab titled `title` (cleaned) is showing this session.
++    func shown(in title: String) -> Bool {
++        !title.isEmpty && all.contains { dockCleanTitle($0) == title }
++    }
++
++    /// The row name of a tab's own session. Before the first prompt there is
++    /// no transcript yet, but the focused tab's title already carries a name
++    /// given with -n.
++    static func ownName(_ t: DockTitles?, title: String, focused: Bool, fallback: String) -> String {
++        if let chosen = t?.chosen { return chosen }
++        if focused, !title.isEmpty, !["Claude Code", "Ghostty"].contains(title) { return title }
++        return fallback
++    }
++}
++
++/// A terminal title without the status glyphs Claude Code puts before it.
++func dockCleanTitle(_ title: String) -> String {
++    var s = Substring(title)
++    while let c = s.first, !(c.isLetter || c.isNumber || c == "/" || c == "~" || c == "." || c == "_") {
++        s = s.dropFirst()
++    }
++    return s.trimmingCharacters(in: .whitespaces)
 +}
 diff --git a/macos/Sources/Features/Dock/DockUpdates.swift b/macos/Sources/Features/Dock/DockUpdates.swift
 new file mode 100644

@@ -262,6 +262,7 @@ def clip: tostring | split("\n")[0] | if length > 160 then .[0:157] + "..." else
         session_id: ($in.session_id // ""),
         project: $project,
         cwd: ($in.cwd // $o.cwd // ""),
+        transcript: ($in.transcript_path // $o.transcript // null),
         name: ($project | sub("/+$"; "") | split("/") | last // ""),
         dock_tab_id: (if $dock == "" then null else $dock end),
         claude_pid: num($claude_pid),

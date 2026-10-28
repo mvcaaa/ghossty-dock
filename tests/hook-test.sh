@@ -75,8 +75,10 @@ function main() {
     check "permission prompt is waiting" "$f" '.status' "waiting"
     check "permission prompt names the tool call" "$f" '.prompt' "Allow Bash: npm test"
     check "permission prompt can be answered" "$f" '.ask.kind' "permission"
+    check "transcript path recorded for the sidebar's names" "$f" '.transcript' "$transcript"
     fire '{"hook_event_name":"Notification","session_id":"s1","cwd":"/x/my-proj","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}'
     check "permission prompt without a transcript says what Claude said" "$f" '.prompt' "Claude needs your permission to use Bash"
+    check "transcript path kept when an event has none" "$f" '.transcript' "$transcript"
 
     fire '{"hook_event_name":"Stop","session_id":"s1","cwd":"/x/my-proj"}'
     check "stop is done" "$f" '.status' "done"
