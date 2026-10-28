@@ -8104,10 +8104,10 @@ index 0000000..3d20550
 +}
 diff --git a/macos/Sources/Features/Dock/DockSettings.swift b/macos/Sources/Features/Dock/DockSettings.swift
 new file mode 100644
-index 0000000..33852cd
+index 0000000..481cc5e
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSettings.swift
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,448 @@
 +import AppKit
 +import ServiceManagement
 +import SwiftUI
@@ -8132,6 +8132,7 @@ index 0000000..33852cd
 +    static let notifyWaitingKey = "dock.notifyWaiting"
 +    static let raiseWaitingKey = "dock.raiseWaiting"
 +    static let showWorkspaceKey = "dock.showWorkspace"
++    static let warnSharedFolderKey = "dock.warnSharedFolder"
 +    static let raiseFinishedKey = "dock.raiseFinished"
 +    /// Hold the window back while any session is still running.
 +    static let raiseWhenAllQuietKey = "dock.raiseWhenAllQuiet"
@@ -8160,6 +8161,7 @@ index 0000000..33852cd
 +            showCostKey: true,
 +            notifyWaitingKey: true,
 +            showWorkspaceKey: true,
++            warnSharedFolderKey: true,
 +            notifyFinishedKey: true,
 +            showBellKey: true,
 +            bellKeepKey: 200,
@@ -8212,6 +8214,7 @@ index 0000000..33852cd
 +    @AppStorage(DockSettings.groupingKey) private var grouping = DockSettings.Grouping.none
 +    @AppStorage(DockSettings.showCostKey) private var showCost = true
 +    @AppStorage(DockSettings.showWorkspaceKey) private var showWorkspace = true
++    @AppStorage(DockSettings.warnSharedFolderKey) private var warnSharedFolder = true
 +    @AppStorage(DockSettings.notifyWaitingKey) private var notifyWaiting = true
 +    @AppStorage(DockSettings.raiseWaitingKey) private var raiseWaiting = false
 +    @AppStorage(DockSettings.raiseFinishedKey) private var raiseFinished = false
@@ -8262,6 +8265,7 @@ index 0000000..33852cd
 +                }
 +                Toggle("Show what each session has cost", isOn: $showCost)
 +                Toggle("Show git branch, pull request and ports", isOn: $showWorkspace)
++                Toggle("Warn when two sessions share a folder", isOn: $warnSharedFolder)
 +                Text("Drag a row by its grip (⋮⋮ on the right) to move it, or right-click → Move Up/Down; the sort becomes “As you drag them”. Right-click also renames, pins or colours it.")
 +                    .font(.callout)
 +                Toggle("Also show Ghostty's tab bar", isOn: $showTabBar)
@@ -8678,10 +8682,10 @@ index 0000000..aa4116b
 +}
 diff --git a/macos/Sources/Features/Dock/DockSidebarView.swift b/macos/Sources/Features/Dock/DockSidebarView.swift
 new file mode 100644
-index 0000000..d6c5053
+index 0000000..e7e8690
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSidebarView.swift
-@@ -0,0 +1,1422 @@
+@@ -0,0 +1,1423 @@
 +import AppKit
 +import SwiftUI
 +import UniformTypeIdentifiers
@@ -9350,6 +9354,7 @@ index 0000000..d6c5053
 +    @State private var hoverGit = false
 +    @AppStorage(DockSettings.selectedRingKey) private var selectedRing = DockRing.blue
 +    @AppStorage(DockSettings.selectedRunningRingKey) private var selectedRunningRing = DockRing.gold
++    @AppStorage(DockSettings.warnSharedFolderKey) private var warnSharedFolder = true
 +
 +    private var folder: String { row.project ?? row.detail }
 +    private func viewDiff() { DockDiffWindow.shared.show(folder: folder, name: row.name) }
@@ -9399,7 +9404,7 @@ index 0000000..d6c5053
 +                        .truncationMode(.tail)
 +                }
 +                // Two sessions in one folder can edit the same files.
-+                if let other = DockSessions.shared.sharesFolder(row) {
++                if warnSharedFolder, let other = DockSessions.shared.sharesFolder(row) {
 +                    // Both rows usually carry the folder's name, so naming
 +                    // the other here only truncated to "wordpress-d…(1)”".
 +                    Label("Shares its folder", systemImage: "exclamationmark.triangle.fill")
