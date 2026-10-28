@@ -79,8 +79,29 @@ function older_sdk() {
     done | sort -t. -k1,1n -k2,2n | tail -1 | cut -d' ' -f2-
 }
 
+# SDKs from Xcode 26.4 on list their libraries for arm64e only, so Zig (which
+# builds arm64) finds no libSystem symbols in them. Prints a copy of the SDK
+# in vendor/ whose stubs list arm64 too: arm64 programs load the same arm64e
+# system libraries, so only the linker's view changes.
+function arm64_sdk() {
+    local sdk=$1 copy
+    # The first document's targets are libSystem's own; later ones are its parts.
+    awk '/^targets:/ { on = 1 } on { print } on && /]/ { exit }' "$sdk/usr/lib/libSystem.B.tbd" |
+        grep -q 'arm64-macos' && { echo "$sdk"; return; }
+    copy="$VENDOR/$(basename "$sdk" .sdk)-arm64.sdk"
+    if [ ! -d "$copy" ]; then
+        cp -c -R "$sdk" "$copy.tmp" || return 1
+        grep -rl --include='*.tbd' 'arm64e-macos' "$copy.tmp" |
+            xargs perl -pi -e 's/(?<![\w.-])arm64e-macos/arm64-macos, arm64e-macos/g' || return 1
+        mv "$copy.tmp" "$copy" || return 1
+    fi
+    echo "$copy"
+}
+
 # Zig asks `xcrun --sdk macosx --show-sdk-path`, which ignores SDKROOT, so a
 # shim earlier on PATH answers that one question with the given SDK.
+# Xcode 27's libtool skips every member of Zig's archives ("not 8-byte
+# aligned"), so the libtool shim merges them with Zig's own archiver instead.
 function zig_build_with_sdk() {
     local sdk=$1 shim
     shift
@@ -90,7 +111,16 @@ function zig_build_with_sdk() {
 if [ "\$*" = "--sdk macosx --show-sdk-path" ]; then echo "$sdk"; exit 0; fi
 exec /usr/bin/xcrun "\$@"
 EOS
-    chmod +x "$shim/xcrun"
+    cat >"$shim/libtool" <<EOS
+#!/bin/bash
+if [ "\$1" = "-static" ] && [ "\$2" = "-o" ]; then
+    out=\$3
+    shift 3
+    rm -f "\$out" && "$VENDOR/zig/zig" ar qcL --format=darwin "\$out" "\$@" && exec "$VENDOR/zig/zig" ar s "\$out"
+fi
+exec /usr/bin/libtool "\$@"
+EOS
+    chmod +x "$shim/xcrun" "$shim/libtool"
     (cd "$SRC" && PATH="$shim:$PATH" "$VENDOR/zig/zig" build "$@")
     local rc=$?
     rm -rf "$shim"
@@ -107,6 +137,11 @@ function build_lib() {
         (cd "$SRC" && "$VENDOR/zig/zig" build "${args[@]}") && return
         local sdk
         sdk=$(older_sdk)
+        if [ -n "$sdk" ]; then
+            echo "== retry libghostty against ${sdk##*/}"
+            zig_build_with_sdk "$sdk" "${args[@]}" && return
+        fi
+        sdk=$(arm64_sdk "${sdk:-$(xcrun --sdk macosx --show-sdk-path)}")
         if [ -n "$sdk" ]; then
             echo "== retry libghostty against ${sdk##*/}"
             zig_build_with_sdk "$sdk" "${args[@]}" && return
