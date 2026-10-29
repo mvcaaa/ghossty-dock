@@ -1,8 +1,8 @@
 diff --git a/macos/Sources/App/macOS/AppDelegate.swift b/macos/Sources/App/macOS/AppDelegate.swift
-index b02337e..e077c6c 100644
+index b02337e..d6b1886 100644
 --- a/macos/Sources/App/macOS/AppDelegate.swift
 +++ b/macos/Sources/App/macOS/AppDelegate.swift
-@@ -210,6 +210,11 @@ class AppDelegate: NSObject,
+@@ -210,6 +210,12 @@ class AppDelegate: NSObject,
          // Store our start time
          applicationLaunchTime = ProcessInfo.processInfo.systemUptime
  
@@ -10,11 +10,12 @@ index b02337e..e077c6c 100644
 +        DockSettings.register()
 +        DockSessions.shared.start()
 +        DockUpdates.shared.start()
++        DockLocalNetwork.touch()
 +
          // Check if secure input was enabled when we last quit.
          if UserDefaults.ghostty.bool(forKey: "SecureInput") != SecureInput.shared.enabled {
              toggleSecureInput(self)
-@@ -307,6 +312,9 @@ class AppDelegate: NSObject,
+@@ -307,6 +313,9 @@ class AppDelegate: NSObject,
              }
  
              ghostty_app_set_color_scheme(app, scheme)
@@ -24,7 +25,7 @@ index b02337e..e077c6c 100644
          }
  
          // Setup our menu
-@@ -356,7 +364,8 @@ class AppDelegate: NSObject,
+@@ -356,7 +365,8 @@ class AppDelegate: NSObject,
              // is possible to have other windows in a few scenarios:
              //   - if we're opening a URL since `application(_:openFile:)` is called before this.
              //   - if we're restoring from persisted state
@@ -34,7 +35,7 @@ index b02337e..e077c6c 100644
                  undoManager.disableUndoRegistration()
                  _ = TerminalController.newWindow(ghostty)
                  undoManager.enableUndoRegistration()
-@@ -427,6 +436,9 @@ class AppDelegate: NSObject,
+@@ -427,6 +437,9 @@ class AppDelegate: NSObject,
      }
  
      func applicationWillTerminate(_ notification: Notification) {
@@ -44,7 +45,7 @@ index b02337e..e077c6c 100644
          // We have no notifications we want to persist after death,
          // so remove them all now. In the future we may want to be
          // more selective and only remove surface-targeted notifications.
-@@ -574,6 +586,9 @@ class AppDelegate: NSObject,
+@@ -574,6 +587,9 @@ class AppDelegate: NSObject,
      }
  
      private func localEventKeyDown(_ event: NSEvent) -> NSEvent? {
@@ -54,7 +55,7 @@ index b02337e..e077c6c 100644
          // If the tab overview is visible and escape is pressed, close it.
          // This can't POSSIBLY be right and is probably a FirstResponder problem
          // that we should handle elsewhere in our program. But this works and it
-@@ -796,13 +811,9 @@ class AppDelegate: NSObject,
+@@ -796,13 +812,9 @@ class AppDelegate: NSObject,
          DispatchQueue.main.async { self.syncAppearance(config: config) }
  
          // Decide whether to hide/unhide app from dock and app switcher
@@ -71,7 +72,7 @@ index b02337e..e077c6c 100644
  
          // If we have configuration errors, we need to show them.
          let c = ConfigurationErrorsController.sharedInstance
-@@ -894,6 +905,20 @@ class AppDelegate: NSObject,
+@@ -894,6 +906,20 @@ class AppDelegate: NSObject,
          didReceive: UNNotificationResponse,
          withCompletionHandler: () -> Void
      ) {
@@ -92,7 +93,7 @@ index b02337e..e077c6c 100644
          ghostty.handleUserNotification(response: didReceive)
          withCompletionHandler()
      }
-@@ -903,7 +928,8 @@ class AppDelegate: NSObject,
+@@ -903,7 +929,8 @@ class AppDelegate: NSObject,
          willPresent: UNNotification,
          withCompletionHandler: (UNNotificationPresentationOptions) -> Void
      ) {
@@ -102,7 +103,7 @@ index b02337e..e077c6c 100644
          let options: UNNotificationPresentationOptions = shouldPresent ? [.banner, .sound] : []
          withCompletionHandler(options)
      }
-@@ -941,7 +967,7 @@ class AppDelegate: NSObject,
+@@ -941,7 +968,7 @@ class AppDelegate: NSObject,
      // MARK: - IB Actions
  
      @IBAction func openConfig(_ sender: Any?) {
@@ -111,7 +112,7 @@ index b02337e..e077c6c 100644
      }
  
      @IBAction func reloadConfig(_ sender: Any?) {
-@@ -949,7 +975,10 @@ class AppDelegate: NSObject,
+@@ -949,7 +976,10 @@ class AppDelegate: NSObject,
      }
  
      @IBAction func checkForUpdates(_ sender: Any?) {
@@ -123,7 +124,7 @@ index b02337e..e077c6c 100644
          // UpdateSimulator.happyPath.simulate(with: updateViewModel)
      }
  
-@@ -970,12 +999,12 @@ class AppDelegate: NSObject,
+@@ -970,12 +1000,12 @@ class AppDelegate: NSObject,
      }
  
      @IBAction func showAbout(_ sender: Any?) {
@@ -139,7 +140,7 @@ index b02337e..e077c6c 100644
      }
  
      @IBAction func toggleSecureInput(_ sender: Any) {
-@@ -1104,6 +1133,8 @@ extension AppDelegate {
+@@ -1104,6 +1134,8 @@ extension AppDelegate {
          // Note: This COULD Be done all in the xib file, but I find it easier to
          // modify this stuff as code.
          self.menuAbout?.setImageIfDesired(systemSymbolName: "info.circle")
@@ -4705,6 +4706,57 @@ index 0000000..dad1607
 +            withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) { angle = 360 }
 +            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) { bob = true }
 +        }
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockLocalNetwork.swift b/macos/Sources/Features/Dock/DockLocalNetwork.swift
+new file mode 100644
+index 0000000..a9a7c6b
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockLocalNetwork.swift
+@@ -0,0 +1,45 @@
++import Foundation
++import Network
++
++/// Programs in a tab reach the local network on this app's Local Network
++/// permission, but macOS 27 neither asks nor lists the app when only they
++/// connect: they fail with "No route to host". One datagram from the app
++/// itself to the router does, so the permission can be granted.
++enum DockLocalNetwork {
++    static func touch() {
++        DispatchQueue.global(qos: .utility).async {
++            guard let gateway = gateway() else { return }
++            // Port 9 is discard: nothing answers, nothing is sent back.
++            let c = NWConnection(host: NWEndpoint.Host(gateway), port: 9, using: .udp)
++            c.stateUpdateHandler = { state in
++                DockLog.tools.info("local network touch \(gateway, privacy: .public): \(String(describing: state), privacy: .public)")
++                switch state {
++                case .ready:
++                    c.send(content: Data([0]), completion: .contentProcessed { _ in c.cancel() })
++                case .failed, .waiting:
++                    c.cancel()
++                case .cancelled:
++                    c.stateUpdateHandler = nil
++                default:
++                    break
++                }
++            }
++            c.start(queue: .global(qos: .utility))
++        }
++    }
++
++    /// The default route's IPv4 gateway.
++    static func gateway() -> String? {
++        guard let out = DockProcess.run("/sbin/route", ["-n", "get", "default"], timeout: 5),
++              out.status == 0 else { return nil }
++        return parseGateway(out.text)
++    }
++
++    static func parseGateway(_ route: String) -> String? {
++        for line in route.split(separator: "\n") {
++            let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
++            if parts.count == 2, parts[0] == "gateway", parts[1].split(separator: ".").count == 4 { return parts[1] }
++        }
++        return nil
 +    }
 +}
 diff --git a/macos/Sources/Features/Dock/DockLog.swift b/macos/Sources/Features/Dock/DockLog.swift

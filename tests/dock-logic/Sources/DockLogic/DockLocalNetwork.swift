@@ -1,0 +1,1 @@
+../../../../vendor/ghostty/macos/Sources/Features/Dock/DockLocalNetwork.swift
