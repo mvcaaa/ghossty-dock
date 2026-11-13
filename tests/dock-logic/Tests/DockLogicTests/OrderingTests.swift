@@ -89,6 +89,18 @@ final class OrderingTests: XCTestCase {
         XCTAssertEqual(DockOrdering.activityDrop(keyPinned: true, targetPinned: nil), .ignore)
     }
 
+    func testActivityStepMovesWithinPins() {
+        XCTAssertEqual(DockOrdering.stepPinned("b", by: -1, pinned: ["a", "b", "c"], manual: ["x", "a", "b", "c"]),
+                       ["b", "a", "c", "x"])
+        XCTAssertEqual(DockOrdering.stepPinned("a", by: 1, pinned: ["a", "b"], manual: []), ["b", "a"])
+    }
+
+    func testActivityStepStopsAtPinEdgesAndSkipsUnpinned() {
+        XCTAssertNil(DockOrdering.stepPinned("a", by: -1, pinned: ["a", "b"], manual: []))
+        XCTAssertNil(DockOrdering.stepPinned("b", by: 1, pinned: ["a", "b"], manual: []))
+        XCTAssertNil(DockOrdering.stepPinned("u", by: -1, pinned: ["a", "b"], manual: []))
+    }
+
     func testMoveStartsFromWhatIsShown() {
         let moved = DockOrdering.move("d", before: "b", visible: ["b", "d", "c", "a"], manual: [])
         XCTAssertEqual(moved, ["d", "b", "c", "a"])

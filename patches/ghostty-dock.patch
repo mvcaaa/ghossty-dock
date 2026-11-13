@@ -6084,10 +6084,10 @@ index 0000000..bc033d2
 +}
 diff --git a/macos/Sources/Features/Dock/DockOrdering.swift b/macos/Sources/Features/Dock/DockOrdering.swift
 new file mode 100644
-index 0000000..5f4e71c
+index 0000000..08bc6e8
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockOrdering.swift
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,294 @@
 +import Foundation
 +
 +/// What a tab is doing. Raw values are the urgency order: needs you first.
@@ -6291,6 +6291,15 @@ index 0000000..5f4e71c
 +    static func activityDrop(keyPinned: Bool, targetPinned: Bool?) -> Drop {
 +        guard targetPinned == true else { return .ignore }
 +        return keyPinned ? .reorder : .pinAndReorder
++    }
++
++    /// Move Up/Down in the Activity order: a pinned row steps within the
++    /// pinned block. The new hand-made order, or nil when it can't move.
++    static func stepPinned(_ key: String, by step: Int, pinned: [String], manual: [String]) -> [String]? {
++        guard let i = pinned.firstIndex(of: key), pinned.indices.contains(i + step) else { return nil }
++        var pins = pinned
++        pins.swapAt(i, i + step)
++        return pins + manual.filter { !pins.contains($0) }
 +    }
 +
 +    /// Activity order's sections: shells, needs you, running, then finished or idle.
@@ -7775,10 +7784,10 @@ index 0000000..764cc07
 +}
 diff --git a/macos/Sources/Features/Dock/DockSessions.swift b/macos/Sources/Features/Dock/DockSessions.swift
 new file mode 100644
-index 0000000..7572927
+index 0000000..c67cf3b
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSessions.swift
-@@ -0,0 +1,1907 @@
+@@ -0,0 +1,1925 @@
 +import AppKit
 +import Combine
 +import UserNotifications
@@ -9308,11 +9317,29 @@ index 0000000..7572927
 +
 +    /// Move Up / Move Down from the row's menu: one place in the sidebar.
 +    func move(_ row: Row, by step: Int) {
++        if DockSettings.order == .activity {
++            guard let list = stepPinned(row, by: step) else { return }
++            UserDefaults.standard.set(list, forKey: DockSettings.manualOrderKey)
++            heldKeys = []
++            refresh()
++            return
++        }
 +        let keys = visibleRows.map(\.key)
 +        guard let i = keys.firstIndex(of: row.key) else { return }
 +        let to = i + step
 +        guard keys.indices.contains(to) else { return }
 +        move(row.key, before: step < 0 ? keys[to] : (to + 1 < keys.count ? keys[to + 1] : nil))
++    }
++
++    /// Whether the row's menu offers Move Up/Down that way.
++    func canMove(_ row: Row, by step: Int) -> Bool {
++        if DockSettings.order == .activity { return stepPinned(row, by: step) != nil }
++        return (step < 0 ? visibleRows.first : visibleRows.last)?.key != row.key
++    }
++
++    private func stepPinned(_ row: Row, by step: Int) -> [String]? {
++        DockOrdering.stepPinned(row.key, by: step, pinned: visibleRows.filter(\.pinned).map(\.key),
++                                manual: DockSettings.manualOrder)
 +    }
 +
 +    /// Shows an idle session as Finished again, to come back to it; it
@@ -9688,7 +9715,7 @@ index 0000000..7572927
 +}
 diff --git a/macos/Sources/Features/Dock/DockSettings.swift b/macos/Sources/Features/Dock/DockSettings.swift
 new file mode 100644
-index 0000000..b76d036
+index 0000000..fab84ed
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSettings.swift
 @@ -0,0 +1,463 @@
@@ -9854,7 +9881,7 @@ index 0000000..b76d036
 +                Toggle("Show what each session has cost", isOn: $showCost)
 +                Toggle("Show git branch, pull request and ports", isOn: $showWorkspace)
 +                Toggle("Warn when two sessions share a folder", isOn: $warnSharedFolder)
-+                Text("Drag a row by its grip (⋮⋮ on the right) to move it, or right-click → Move Up/Down; the sort becomes “As you drag them”. Right-click also renames, pins or colours it.")
++                Text("Drag a row by its grip (⋮⋮ on the right) to move it, or right-click → Move Up/Down; the sort becomes “As you drag them” (in Activity, only pinned rows move). Right-click also renames, pins or colours it.")
 +                    .font(.callout)
 +                Toggle("Also show Ghostty's tab bar", isOn: $showTabBar)
 +            }
@@ -10290,10 +10317,10 @@ index 0000000..ea8091f
 +}
 diff --git a/macos/Sources/Features/Dock/DockSidebarView.swift b/macos/Sources/Features/Dock/DockSidebarView.swift
 new file mode 100644
-index 0000000..afce260
+index 0000000..aadd2da
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSidebarView.swift
-@@ -0,0 +1,1689 @@
+@@ -0,0 +1,1701 @@
 +import AppKit
 +import SwiftUI
 +import UniformTypeIdentifiers
@@ -10421,6 +10448,15 @@ index 0000000..afce260
 +                .padding(.vertical, 4)
 +            }
 +            .onHover { model.holdOrder = $0 }
++            // The pointer can be gone without a hover exit: the sidebar hid,
++            // or the window or app lost focus under it.
++            .onDisappear { model.holdOrder = false }
++            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
++                model.holdOrder = false
++            }
++            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
++                model.holdOrder = false
++            }
 +            DockHistoryPanel()
 +        }
 +        .frame(width: CGFloat(width.clamped(to: Self.widthRange)))
@@ -11256,10 +11292,13 @@ index 0000000..afce260
 +            if row.parent != nil {
 +                Button { model.standAlone(row) } label: { Self.item("Stand on Its Own", "arrow.up.left", .systemTeal) }
 +            }
-+            Button { model.move(row, by: -1) } label: { Self.item("Move Up", "arrow.up", .systemIndigo) }
-+                .disabled(model.visibleRows.first?.key == row.key)
-+            Button { model.move(row, by: 1) } label: { Self.item("Move Down", "arrow.down", .systemIndigo) }
-+                .disabled(model.visibleRows.last?.key == row.key)
++            // In the Activity order only pinned rows have a place of their own.
++            if DockSettings.order != .activity || row.pinned {
++                Button { model.move(row, by: -1) } label: { Self.item("Move Up", "arrow.up", .systemIndigo) }
++                    .disabled(!model.canMove(row, by: -1))
++                Button { model.move(row, by: 1) } label: { Self.item("Move Down", "arrow.down", .systemIndigo) }
++                    .disabled(!model.canMove(row, by: 1))
++            }
 +            Menu {
 +                ForEach(DockTag.offered + (row.tag.map { DockTag.offered.contains($0) ? [] : [$0] } ?? []), id: \.self) { tag in
 +                    if tag == .blue || tag == .blaze || !DockTag.offered.contains(tag) { Divider() }
