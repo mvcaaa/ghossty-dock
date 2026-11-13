@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Installs Ghostty Dock: the opener and the Claude Code hook into
-# ~/.local/bin, the hook into ~/.claude/settings.json, the "Launch ... in
+# Installs Ghostty Dock: the opener and the Claude Code hooks into
+# ~/.local/bin, the hooks into ~/.claude/settings.json, the dock-browser
+# tools (the browser beside a tab) for every Claude Code, the "Launch ... in
 # Ghostty" Finder Quick Actions added if missing and switched to open tabs,
 # and the app (Ghostty
 # with the session sidebar built in, scripts/build-terminal.sh) into
@@ -18,6 +19,8 @@ AGENT_LABEL="consulting.cloudscale.ghosttydock"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 APP="$HOME/Applications/Ghostty Dock.app"
 HOOK_EVENTS=(SessionStart UserPromptSubmit PreToolUse PostToolUse Notification Stop SessionEnd)
+# Claude Code's tools for the browser beside a tab (bin/ghostty-dock-browser-mcp).
+MCP_NAME="dock-browser"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,8 +75,10 @@ function main() {
 
     print_step 1 4 "Scripts into $BIN_DIR"
     install_scripts || exit 1
-    print_step 2 4 "Claude Code hooks in $SETTINGS"
+    print_step 2 4 "Claude Code hooks in $SETTINGS, browser tools"
     install_hooks || exit 1
+    install_browser_tools
+    install_prompt_theme
     print_step 3 4 "Finder Quick Actions open tabs"
     add_quick_actions || exit 1
     switch_quick_actions || exit 1
@@ -91,20 +96,21 @@ function main() {
         bash "$ROOT/scripts/build-terminal.sh" --no-open || exit 1
     fi
     print_success "Ghostty Dock is installed: open it from ~/Applications"
+    check_claude_login
     echo "  - Sessions already open keep their own Ghostty app until closed."
 }
 
 function install_scripts() {
     mkdir -p "$BIN_DIR" || return 1
     local f
-    for f in ghostty-dock ghostty-dock-open ghostty-dock-hook; do
+    for f in ghostty-dock ghostty-dock-open ghostty-dock-hook ghostty-dock-context ghostty-dock-browser-mcp ghostty-dock-browse ghostty-dock-rc-titles; do
         install -m 0755 "$ROOT/bin/$f" "$BIN_DIR/$f" || { print_error "could not install $f"; return 1; }
     done
     install -m 0755 "$ROOT/scripts/move-to-dock.sh" "$BIN_DIR/ghostty-dock-move" ||
         { print_error "could not install ghostty-dock-move"; return 1; }
     install -m 0755 "$ROOT/scripts/restart-dock.sh" "$BIN_DIR/ghostty-dock-restart" ||
         { print_error "could not install ghostty-dock-restart"; return 1; }
-    print_success "ghostty-dock, ghostty-dock-open, ghostty-dock-hook, ghostty-dock-move, ghostty-dock-restart"
+    print_success "ghostty-dock, ghostty-dock-open, ghostty-dock-hook, ghostty-dock-context, ghostty-dock-browser-mcp, ghostty-dock-browse, ghostty-dock-rc-titles, ghostty-dock-move, ghostty-dock-restart"
 }
 
 function install_hooks() {
@@ -119,26 +125,105 @@ function install_hooks() {
     mkdir -p "$(dirname "$backup")" && cp "$SETTINGS" "$backup" || return 1
 
     local cmd="$BIN_DIR/ghostty-dock-hook"
+    local context="$BIN_DIR/ghostty-dock-context"
     local events_json
     events_json=$(printf '%s\n' "${HOOK_EVENTS[@]}" | jq -R . | jq -s .)
     local tmp="$SETTINGS.ghostty-dock.tmp"
     # PreToolUse only matters for questions; every other tool call is already
     # "running" from the prompt, and PostToolUse clears a question once answered.
-    jq --arg cmd "$cmd" --argjson events "$events_json" '
-        def mine: any(.hooks[]?; (.command // "") | contains("ghostty-dock-hook"));
+    # SessionStart also tells a session in a dock tab about the browser.
+    jq --arg cmd "$cmd" --arg context "$context" --argjson events "$events_json" '
+        def has($name): any(.hooks[]?; (.command // "") | contains($name));
         reduce $events[] as $ev (.;
             .hooks[$ev] = ((.hooks[$ev] // []) as $list
-                | if any($list[]; mine) then $list
+                | if any($list[]; has("ghostty-dock-hook")) then $list
                   else $list + [{
                       matcher: (if $ev == "PreToolUse" then "AskUserQuestion|ExitPlanMode" else "" end),
                       hooks: [{type: "command", command: $cmd, timeout: 5}]
                   }] end))
+        | .hooks.SessionStart = ((.hooks.SessionStart // []) as $list
+            | if any($list[]; has("ghostty-dock-context")) then $list
+              else $list + [{matcher: "", hooks: [{type: "command", command: $context, timeout: 5}]}] end)
     ' "$SETTINGS" >"$tmp" && jq -e . "$tmp" >/dev/null && mv -f "$tmp" "$SETTINGS" || {
         rm -f "$tmp"
         print_error "could not update $SETTINGS (backup: $backup)"
         return 1
     }
     print_success "hooked ${HOOK_EVENTS[*]} (backup: $backup)"
+}
+
+# The dock-browser MCP server, for every Claude Code of this user: the
+# browser beside a tab. Only a warning when it cannot be added, since the
+# rest of the dock works without it.
+function install_browser_tools() {
+    if ! command -v claude >/dev/null 2>&1; then
+        print_warning "claude is not on PATH: add the browser tools with claude mcp add --scope user $MCP_NAME -- $BIN_DIR/ghostty-dock-browser-mcp"
+        return 0
+    fi
+    command -v node >/dev/null 2>&1 || print_warning "the browser tools need Node.js (node and npx)"
+    if claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
+        print_success "browser tools: $MCP_NAME already added"
+        return 0
+    fi
+    if claude mcp add --scope user "$MCP_NAME" -- "$BIN_DIR/ghostty-dock-browser-mcp" >/dev/null 2>&1; then
+        print_success "browser tools: $MCP_NAME added for every Claude Code session"
+    else
+        print_warning "could not add the browser tools: claude mcp add --scope user $MCP_NAME -- $BIN_DIR/ghostty-dock-browser-mcp"
+    fi
+}
+
+# Sessions can't start until Claude Code is logged in: offers to log in
+# now (the app also asks, with a Log In button in the sidebar).
+function check_claude_login() {
+    if ! command -v claude >/dev/null 2>&1; then
+        print_warning "Claude Code is not installed: curl -fsSL https://claude.ai/install.sh | bash"
+        return 0
+    fi
+    local status
+    status=$(claude auth status --json 2>/dev/null)
+    if echo "$status" | jq -e '.loggedIn == true or (.apiProvider // "firstParty") != "firstParty"' >/dev/null 2>&1; then
+        print_success "Claude Code: logged in$(echo "$status" | jq -r '.email // empty | " as " + .')"
+        return 0
+    fi
+    print_warning "Claude Code is not logged in, so sessions won't start"
+    if [ -t 0 ]; then
+        local answer
+        read -r -p "  Log in now? [Y/n] " answer
+        case "$answer" in
+        [nN]*) echo "  - Later: claude auth login (or Log In… in Ghostty Dock's sidebar)" ;;
+        *) claude auth login ;;
+        esac
+    else
+        echo "  - Run: claude auth login (or Log In… in Ghostty Dock's sidebar)"
+    fi
+}
+
+# Claude Code themes like its own light and dark, but with your prompts on
+# 256-colour slots (255 light, 237 dark) rather than a fixed grey: in a tab
+# you coloured, Ghostty Dock makes that slot a strong shade of the colour,
+# so what you typed stands out from Claude's output. Elsewhere the slots
+# are the greys Claude uses anyway. Switches to them from plain light/dark.
+function install_prompt_theme() {
+    local dir="$HOME/.claude/themes" base slot
+    mkdir -p "$dir" || return 0
+    for base in light dark; do
+        [ "$base" = light ] && slot=255 || slot=237
+        jq -n --arg base "$base" --arg c "ansi256($slot)" '{
+            name: ("Ghostty Dock " + $base), base: $base,
+            overrides: {userMessageBackground: $c}
+        }' >"$dir/ghostty-dock-$base.json" || return 0
+    done
+    local theme
+    theme=$(jq -r '.theme // "dark"' "$SETTINGS" 2>/dev/null)
+    case "$theme" in
+    light | dark)
+        local tmp="$SETTINGS.ghostty-dock.tmp"
+        jq --arg t "custom:ghostty-dock-$theme" '.theme = $t' "$SETTINGS" >"$tmp" && mv -f "$tmp" "$SETTINGS" &&
+            print_success "Claude Code theme: Ghostty Dock $theme (prompts in a coloured tab's colour; /theme to change)"
+        ;;
+    custom:ghostty-dock-*) print_success "Claude Code theme: already Ghostty Dock's" ;;
+    *) print_warning "Claude Code theme '$theme' kept: choose Ghostty Dock light or dark in /theme for coloured prompts" ;;
+    esac
 }
 
 # Adds the two Quick Actions Settings → Shortcuts → In Finder gives keys
@@ -223,16 +308,20 @@ function uninstall_all() {
     rm -f "$AGENT_PLIST"
     pkill -x GhosttyDock 2>/dev/null
     rm -rf "$APP"
-    rm -f "$BIN_DIR/ghostty-dock" "$BIN_DIR/ghostty-dock-open" "$BIN_DIR/ghostty-dock-hook" "$BIN_DIR/ghostty-dock-move" "$BIN_DIR/ghostty-dock-restart"
+    rm -f "$BIN_DIR/ghostty-dock" "$BIN_DIR/ghostty-dock-open" "$BIN_DIR/ghostty-dock-hook" "$BIN_DIR/ghostty-dock-move" "$BIN_DIR/ghostty-dock-restart" \
+        "$BIN_DIR/ghostty-dock-context" "$BIN_DIR/ghostty-dock-browser-mcp" "$BIN_DIR/ghostty-dock-browse" "$BIN_DIR/ghostty-dock-rc-titles"
+    command -v claude >/dev/null 2>&1 && claude mcp remove --scope user "$MCP_NAME" >/dev/null 2>&1
     if [ -f "$SETTINGS" ] && jq -e . "$SETTINGS" >/dev/null 2>&1; then
         local tmp="$SETTINGS.ghostty-dock.tmp"
         jq '
             if .hooks then .hooks |= with_entries(
-                .value |= (map(.hooks |= map(select((.command // "") | contains("ghostty-dock-hook") | not)))
+                .value |= (map(.hooks |= map(select((.command // "") | test("ghostty-dock-(hook|context)") | not)))
                            | map(select(.hooks | length > 0))))
             else . end
+            | if (.theme // "") | startswith("custom:ghostty-dock-") then .theme |= ltrimstr("custom:ghostty-dock-") else . end
         ' "$SETTINGS" >"$tmp" && mv -f "$tmp" "$SETTINGS"
     fi
+    rm -f "$HOME/.claude/themes/ghostty-dock-light.json" "$HOME/.claude/themes/ghostty-dock-dark.json"
     # Settings > "One Dock icon" hid Ghostty from the Dock; put it back.
     local cfg="$HOME/.config/ghostty/config"
     if grep -q '^# ghostty-dock: one Dock icon' "$cfg" 2>/dev/null; then

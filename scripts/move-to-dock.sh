@@ -24,6 +24,7 @@ DOCK_BIN="$HOME/Applications/Ghostty Dock.app/Contents/MacOS/ghostty"
 QUIET_SECS=60
 # --now: move at once, interrupting a busy session.
 NOW=false
+REMOTE_NAME=""
 GIVE_UP_SECS=$((12 * 3600))
 
 function usage() {
@@ -36,7 +37,11 @@ usage: ${SCRIPT_NAME} [options]
 options:
     --pid <pid>        Dock only the session in this Ghostty app (default: all)
     --undock <id>      Move this session out of Ghostty Dock into its own Ghostty
+    --shells <pid>     Dock this stock Ghostty with only shells in it: once
+                       what its tabs run has finished, open a shell tab here
+                       in each tab's folder and quit it
     --restart <id>     Stop this Ghostty Dock session and resume it in a new tab
+    --remote-name <n>  With --restart: resume with --remote-control <n>
     --now              Do not wait for a busy session to go quiet (interrupts it)
     --detach           Run in the background and return at once
     --dry-run          Only list what would move
@@ -44,7 +49,10 @@ options:
     --list             Print a line per session outside Ghostty Dock:
                        "window<TAB>pid<TAB>busy<TAB>moving<TAB>name<TAB>cwd",
                        "undocking<TAB>id" per session being undocked and
-                       "restarting<TAB>id" per session being restarted
+                       "restarting<TAB>id" per session being restarted and
+                       "shell<TAB>pid<TAB>tabs<TAB>programs<TAB>moving" per
+                       stock Ghostty with no Claude Code session (programs:
+                       what its tabs run, comma separated, empty when idle)
     -h|--help          Show this help message
 
 EOM
@@ -133,6 +141,22 @@ print(shlex.join(out))
 PY
 }
 
+# Flags with --dangerously-skip-permissions added, as every new session is
+# started (ghostty-claude-launcher), unless CLAUDE_PANEL_BYPASS_PERMISSIONS is
+# off in ~/.config/claude-panel/options or the flags already pick a mode. A
+# session started some other way otherwise came back asking, or in auto mode.
+function with_bypass() {
+    local flags="$1" opt
+    opt=$(grep -E '^CLAUDE_PANEL_BYPASS_PERMISSIONS=' "$HOME/.config/claude-panel/options" 2>/dev/null | tail -1)
+    opt=$(printf '%s' "${opt#*=}" | tr -d "\"' " | tr '[:upper:]' '[:lower:]')
+    case "$opt" in false|0|no|off) echo "$flags"; return ;; esac
+    if grep -qE -- '(^| )(--dangerously-skip-permissions|--permission-mode)( |=|$)' <<<"$flags"; then
+        echo "$flags"
+    else
+        echo "--dangerously-skip-permissions${flags:+ $flags}"
+    fi
+}
+
 # Prints "<session id>\t<cwd>\t<flags>" for a claude pid.
 function session_of() {
     local cpid="$1"
@@ -149,7 +173,7 @@ function session_of() {
     fi
     local quoted
     quoted=$(claude_flags "$cpid") && flags="$quoted"
-    printf '%s\t%s\t%s\n' "$sid" "$cwd" "$flags"
+    printf '%s\t%s\t%s\n' "$sid" "$cwd" "$(with_bypass "$flags")"
 }
 
 # Moves one session; returns 1 while it is still busy.
@@ -214,6 +238,85 @@ function movable_pids() {
     done
 }
 
+# A stock Ghostty's tab count, then what its tabs run in the foreground
+# besides their shells, comma separated ("bash x.sh" counts as x.sh).
+function shell_info() {
+    ps -axo pid=,ppid=,stat=,command= | awk -v root="$1" '
+        { pid = $1; parent[pid] = $2; stat[pid] = $3; $1 = $2 = $3 = ""; sub(/^ +/, ""); cmd[pid] = $0 }
+        END {
+            tabs = 0; progs = ""
+            for (p in cmd) if (parent[p] == root) tabs++
+            for (p in cmd) {
+                if (stat[p] !~ /\+/) continue
+                q = p; under = 0
+                while (q > 1) { q = parent[q]; if (q == root) { under = 1; break } }
+                if (!under) continue
+                n = split(cmd[p], w, " ")
+                prog = w[1]; sub(/^-/, "", prog); sub(/.*\//, "", prog)
+                if (prog ~ /^(login|zsh|bash|sh|fish|tcsh|ksh)$/) {
+                    if (n < 2 || w[2] ~ /^-/) continue
+                    prog = w[2]; sub(/.*\//, "", prog)
+                }
+                if (index("," progs ",", "," prog ",")) continue
+                progs = progs (progs == "" ? "" : ",") prog
+            }
+            printf "%d\t%s\n", tabs, progs
+        }'
+}
+
+# Stock Ghostty apps without a Claude Code session, as --list prints them.
+function shell_apps() {
+    local gpid moving
+    for gpid in $(pgrep -f "^$GHOSTTY_BIN"); do
+        [ -n "$(claude_under "$gpid")" ] && continue
+        moving=0
+        job_running "s$gpid" && moving=1
+        printf 'shell\t%s\t%s\t%s\n' "$gpid" "$(shell_info "$gpid")" "$moving"
+    done
+}
+
+# The folder each tab of a stock Ghostty is in, oldest tab first: its
+# shell's current directory, else home.
+function shell_folders() {
+    local login sh dir
+    for login in $(ps -axo pid=,ppid= | awk -v root="$1" '$2 == root { print $1 }' | sort -n); do
+        sh=$(ps -axo pid=,ppid= | awk -v p="$login" '$2 == p { print $1; exit }')
+        dir=""
+        [ -n "$sh" ] && dir=$(lsof -a -d cwd -p "$sh" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+        [ -d "$dir" ] || dir="$HOME"
+        echo "$dir"
+    done
+}
+
+# Docks a stock Ghostty with only shells in it: waits for what its tabs run
+# to finish (a shell's job can't move without stopping), then opens a shell
+# tab here in each tab's folder and quits it.
+function dock_shells() {
+    local gpid="$1" dry="$2" info progs waited=false
+    while :; do
+        kill -0 "$gpid" 2>/dev/null || { log "Ghostty $gpid: closed before it docked"; return; }
+        [ -n "$(claude_under "$gpid")" ] && { log "Ghostty $gpid: has a Claude Code session now, left it"; return; }
+        info=$(shell_info "$gpid")
+        progs=$(cut -f2 <<<"$info")
+        [ -z "$progs" ] && break
+        $dry && { log "Ghostty $gpid: would wait for $progs to finish"; return; }
+        $waited || log "Ghostty $gpid: docks when $progs finishes"
+        waited=true
+        sleep 10
+    done
+    local folders folder
+    folders=$(shell_folders "$gpid")
+    if $dry; then
+        log "Ghostty $gpid: would open shell tabs in: $(xargs <<<"$folders")"
+        return
+    fi
+    while IFS= read -r folder; do
+        "$OPENER" --shell "$folder" >>"$LOG" 2>&1 || { log "Ghostty $gpid: opening a tab in $folder failed, left it open"; return; }
+    done <<<"$folders"
+    log "Ghostty $gpid: docked $(grep -c . <<<"$folders") shell tab(s)"
+    kill -TERM "$gpid" 2>/dev/null
+}
+
 function job_running() {
     local f="$LOCK_DIR/$1.pid"
     [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null
@@ -241,6 +344,7 @@ function list_sessions() {
         job=$(basename "$f" .pid)
         job_running "$job" && printf 'restarting\t%s\n' "${job#r}"
     done
+    shell_apps
 }
 
 # The claude in a Ghostty Dock tab running session <id>.
@@ -260,6 +364,26 @@ function docked_claude() {
     done
 }
 
+# Flags with --remote-control <name> in place of any Remote Control flag they
+# have: only a launch names a session on the phone.
+function with_remote_name() {
+    local flags="$1" name="$2"
+    [ -z "$name" ] && { echo "$flags"; return; }
+    python3 -c '
+import shlex, sys
+words, out, i = shlex.split(sys.argv[1]), [], 0
+while i < len(words):
+    w = words[i]
+    i += 1
+    if w in ("--remote-control", "--rc"):
+        if i < len(words) and not words[i].startswith("-"):
+            i += 1
+    elif not w.startswith(("--remote-control=", "--rc=")):
+        out.append(w)
+print(" ".join([shlex.quote(w) for w in out] + ["--remote-control", shlex.quote(sys.argv[2])]))
+' "$flags" "$name"
+}
+
 # Moves session <id> out of Ghostty Dock into a stock Ghostty of its own, or
 # with "restart" resumes it in a new Ghostty Dock tab.
 function undock() {
@@ -271,6 +395,12 @@ function undock() {
     [ -n "$cpid" ] || { log "$sid: not running in Ghostty Dock"; return 1; }
     local cwd flags started
     IFS=$'\t' read -r _ cwd flags <<<"$(session_of "$cpid")"
+    flags=$(with_remote_name "$flags" "$REMOTE_NAME")
+    if [ -n "$REMOTE_NAME" ] && [ ! -f "$(transcript_for "$cwd" "$sid")" ]; then
+        # Nothing said yet, so --resume would find nothing to come back to.
+        log "$(basename "$cwd"): no transcript yet, left alone"
+        return 0
+    fi
     started=$(date +%s)
     while ! $NOW && [ "$(quiet_for "$(transcript_for "$cwd" "$sid")")" -lt "$QUIET_SECS" ]; do
         log "$(basename "$cwd"): busy, ${mode}ing once quiet"
@@ -302,6 +432,17 @@ function remove_hidden_setting() {
     perl -0pi -e 's/\n?# ghostty-dock: one Dock icon[^\n]*\nmacos-hidden = always\n//' "$cfg"
 }
 
+# Whether Ghostty Dock would take a new tab, asked before claude is stopped.
+# macOS refuses Apple events to a running copy of the app whose files have
+# been deleted (-1743), and the opener would then fall back to a separate
+# Ghostty: the session leaves the dock. Not running is fine, the opener starts it.
+function dock_answers() {
+    [ -e "$STATE_DIR/disabled" ] && return 0
+    local app='application id "consulting.cloudscale.ghosttydock"'
+    [ "$(osascript -e "$app is running" 2>/dev/null)" = "true" ] || return 0
+    osascript -e "tell $app to count windows" >/dev/null 2>&1
+}
+
 function main() {
     # Sessions we start must not inherit a Claude Code parent marker
     # (CLAUDE_CODE_CHILD_SESSION turns off their transcript saving), nor the
@@ -312,6 +453,7 @@ function main() {
     local only=""
     local undock_id=""
     local restart_id=""
+    local shells_pid=""
     local args=()
     while [ "$1" != "" ]; do
         case $1 in
@@ -326,10 +468,20 @@ function main() {
             undock_id="$1"
             args+=(--undock "$1")
             ;;
+        --shells)
+            shift
+            shells_pid="$1"
+            args+=(--shells "$1")
+            ;;
         --restart)
             shift
             restart_id="$1"
             args+=(--restart "$1")
+            ;;
+        --remote-name)
+            shift
+            REMOTE_NAME="$1"
+            args+=(--remote-name "$1")
             ;;
         --now)
             NOW=true
@@ -369,10 +521,16 @@ function main() {
         exit 0
     fi
 
+    if ! $dry && [ -z "$undock_id" ] && ! dock_answers; then
+        log "Ghostty Dock is refusing new tabs: left every session where it is. Restart Ghostty Dock, then try again."
+        exit 3
+    fi
+
     local job=all
     [ -n "$only" ] && job="g$only"
     [ -n "$undock_id" ] && job="u$undock_id"
     [ -n "$restart_id" ] && job="r$restart_id"
+    [ -n "$shells_pid" ] && job="s$shells_pid"
     if ! $dry; then
         { job_running "$job" || { [ "$job" != "${job#g}" ] && job_running all; }; } &&
             { echo "already moving; log: $LOG"; exit 0; }
@@ -383,6 +541,8 @@ function main() {
         undock "$undock_id" "$dry"
     elif [ -n "$restart_id" ]; then
         undock "$restart_id" "$dry" restart
+    elif [ -n "$shells_pid" ]; then
+        dock_shells "$shells_pid" "$dry"
     else
         dock_all "$dry" "$only"
     fi

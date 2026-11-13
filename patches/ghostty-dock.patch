@@ -181,17 +181,17 @@ index ade9bf3..0556a38 100644
  // rest of the app.
 diff --git a/macos/Sources/Features/Dock/DockAPI.swift b/macos/Sources/Features/Dock/DockAPI.swift
 new file mode 100644
-index 0000000..098a66e
+index 0000000..d6dd4fa
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockAPI.swift
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,190 @@
 +import AppKit
 +
 +/// The app's side of the `ghostty-dock` command: requests are JSON files
 +/// dropped in ~/.local/state/ghostty-dock/api (a folder only you can open),
 +/// answered with a file next to them.
 +///
-+/// Request:  req-<id>.json  {"op": "list" | "focus" | "send" | "keys" | "read" | "notify", ...}
++/// Request:  req-<id>.json  {"op": "list" | "focus" | "send" | "keys" | "read" | "notify" | "browser" | "view", ...}
 +/// Answer:   res-<id>.json  {"ok": true, ...} or {"ok": false, "error": "..."}
 +@MainActor
 +final class DockAPI {
@@ -265,6 +265,17 @@ index 0000000..098a66e
 +                                   source: .script)
 +            model.postExternal(title: title, body: body)
 +            return ["ok": true]
++        }
++        if op == "browser" {
++            return DockBrowser.prepare(surface: r["surface"] as? String, show: r["show"] as? Bool == true)
++        }
++        if op == "url" {
++            guard let url = r["url"] as? String, !url.isEmpty else { return ["ok": false, "error": "say which page"] }
++            return DockBrowser.open(url: url, surface: r["surface"] as? String)
++        }
++        if op == "view" {
++            guard let path = r["path"] as? String, !path.isEmpty else { return ["ok": false, "error": "say which file"] }
++            return DockViewer.open(path: path, surface: r["surface"] as? String, show: r["show"] as? Bool != false)
 +        }
 +        guard let target = r["target"] as? String, !target.isEmpty else {
 +            return ["ok": false, "error": "say which session: a name, a session id or a folder"]
@@ -1646,10 +1657,10 @@ index 0000000..bf8c901
 +}
 diff --git a/macos/Sources/Features/Dock/DockAgentFindView.swift b/macos/Sources/Features/Dock/DockAgentFindView.swift
 new file mode 100644
-index 0000000..1a34e7b
+index 0000000..6b361b3
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockAgentFindView.swift
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,436 @@
 +import AppKit
 +import SwiftUI
 +
@@ -1662,6 +1673,7 @@ index 0000000..1a34e7b
 +    @State private var picked: Set<String> = []
 +    @State private var focused: String?
 +    /// The agents folder installs go to: ~/.claude/agents, or a project's.
++    /// Starts as the selected session's project.
 +    @State private var target: String = ""
 +    @State private var installed: Set<String> = []
 +    @State private var states: [String: DockAgentInstall.State] = [:]
@@ -1713,7 +1725,15 @@ index 0000000..1a34e7b
 +                Divider().overlay(DockPalette.surface)
 +                footer
 +            }
-+            .onAppear(perform: reload)
++            .onAppear {
++                // The selected session's project, so an agent goes where you
++                // are working; every project when that is your home folder.
++                if let row = sessions.rows.first(where: \.selected), !row.detail.isEmpty {
++                    let root = DockAgentConfig.projectRoot(row.detail)
++                    if projects.contains(root) { target = root }
++                }
++                reload()
++            }
 +            .onChange(of: target) { _ in reload() }
 +        } else {
 +            Text("The agent catalogue is missing from the app: reinstall Ghostty Dock.")
@@ -1876,7 +1896,7 @@ index 0000000..1a34e7b
 +                                    .fixedSize(horizontal: false, vertical: true)
 +                            }
 +                        }
-+                        Text("Claude Code still asks before anything your permission settings don't allow.")
++                        Text(DockBypass.enabled ? "It starts with permissions skipped, like your other sessions." : "Claude Code still asks before anything your permission settings don't allow.")
 +                            .font(.caption).foregroundStyle(DockPalette.grey)
 +                    }
 +                }
@@ -2021,7 +2041,7 @@ index 0000000..1a34e7b
 +            error = "ghostty-dock-open is not installed: run install.sh again."
 +            return
 +        }
-+        _ = DockProcess.launch("/bin/bash", [opener, "--command", "caffeinate -i claude --agent \(a.slug)", folder],
++        _ = DockProcess.launch("/bin/bash", [opener, "--command", "caffeinate -i claude \(DockBypass.flags("--agent \(a.slug)"))", folder],
 +                               log: DockLog.sessions)
 +    }
 +
@@ -3187,6 +3207,655 @@ index 0000000..3725d37
 +    private static var registered: [String: UNNotificationCategory] = [:]
 +    private static let categoryLock = NSLock()
 +}
+diff --git a/macos/Sources/Features/Dock/DockBrowser.swift b/macos/Sources/Features/Dock/DockBrowser.swift
+new file mode 100644
+index 0000000..39fe17e
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockBrowser.swift
+@@ -0,0 +1,532 @@
++import AppKit
++import SwiftUI
++
++/// Ghostty Dock: a Chromium browser beside the terminal (⌘⇧B), one per tab,
++/// for watching the app a session is building. Claude Code can drive it over
++/// its debugging port: chrome-devtools-mcp --browserUrl http://127.0.0.1:9223.
++/// Not Chrome's usual 9222: a Chrome already holding 127.0.0.1:9222 pushes
++/// Chromium onto [::1] alone, and the URL above would drive that Chrome.
++///
++/// Chromium is DockBrowser.framework (browser/DockBrowser.mm in the repo),
++/// loaded the first time a browser opens, so the app starts without it.
++@MainActor
++enum DockBrowser {
++    static let port: Int32 = 9223
++    static let widthKey = "dock.browser.width"
++    static let lastAddressKey = "dock.browser.lastAddress"
++    /// $BROWSER in every terminal, so web links Claude Code opens come here,
++    /// unless the app was started with a $BROWSER of the user's own.
++    nonisolated static var browseCommand: String? {
++        guard ProcessInfo.processInfo.environment["BROWSER"] == nil else { return nil }
++        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/ghostty-dock-browse").path
++        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
++    }
++    static let changed = Notification.Name("DockBrowserChanged")
++    static let adopted = Notification.Name("DockBrowserAdopted")
++
++    private typealias Start = @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>,
++                                              Int32) -> UnsafePointer<CChar>
++    private typealias NewView = @convention(c) (UnsafePointer<CChar>) -> UnsafeMutableRawPointer?
++
++    private static var newView: NewView?
++    private static var models: [ObjectIdentifier: DockBrowserModel] = [:]
++    /// The terminal tab whose Claude asked for the browser last (and when):
++    /// a page it opens next, with new_page, goes to that tab's browser.
++    private static var asker: (owner: TerminalController, at: Date)?
++    private static let askerSecs: TimeInterval = 30
++
++    private static var frameworks: String { Bundle.main.privateFrameworksPath ?? "" }
++
++    /// The browser of the tab that owns it (its TerminalController).
++    static func model(for owner: AnyObject) -> DockBrowserModel {
++        let id = ObjectIdentifier(owner)
++        if let m = models[id] { return m }
++        let m = DockBrowserModel()
++        m.owner = owner as? BaseTerminalController
++        models[id] = m
++        return m
++    }
++
++    /// The tab closed: its browser goes with it.
++    static func forget(_ owner: AnyObject) {
++        models.removeValue(forKey: ObjectIdentifier(owner))?.forgotten()
++    }
++
++    /// ⌘⇧B: shows or hides the key tab's browser.
++    static func toggle() {
++        guard let controller = NSApp.keyWindow?.windowController as? TerminalController else {
++            NSSound.beep()
++            return
++        }
++        model(for: controller).toggle()
++    }
++
++    /// `ghostty-dock browser`, as Claude's dock-browser tools run it: Chromium
++    /// started, and a page in the browser of the terminal tab holding
++    /// `surface` (else the key window's), shown only if asked.
++    static func prepare(surface: String?, show: Bool) -> [String: Any] {
++        let key = NSApp.keyWindow?.windowController as? TerminalController
++        guard let owner = controller(holding: surface) ?? key ?? TerminalController.all.first else {
++            return ["ok": false, "error": "no terminal window is open"]
++        }
++        guard model(for: owner).prepare(show: show) else { return ["ok": false, "error": "the browser did not start"] }
++        asker = (owner, Date())
++        return ["ok": true, "url": "http://127.0.0.1:\(port)"]
++    }
++
++    /// `ghostty-dock url`, which Ghostty Dock's terminals have as $BROWSER:
++    /// the page as a new tab in the browser of the terminal tab holding
++    /// `surface` (else the key window's), and the browser open.
++    static func open(url: String, surface: String?) -> [String: Any] {
++        guard let link = URL(string: url), ["http", "https"].contains(link.scheme?.lowercased()) else {
++            return ["ok": false, "error": "not a web link: \(url)"]
++        }
++        let key = NSApp.keyWindow?.windowController as? TerminalController
++        guard let owner = controller(holding: surface) ?? key ?? TerminalController.all.first else {
++            return ["ok": false, "error": "no terminal window is open"]
++        }
++        guard model(for: owner).show(link.absoluteString) else { return ["ok": false, "error": "the browser did not start"] }
++        return ["ok": true, "url": link.absoluteString]
++    }
++
++    /// A web link ⌘-clicked in a terminal opens beside it. False for any
++    /// other link, or a terminal outside a dock tab.
++    static func open(_ url: URL, from surface: Ghostty.SurfaceView?) -> Bool {
++        open(url, in: surface?.window?.windowController as? TerminalController)
++    }
++
++    /// A web link opened in the terminal tab `owner`, or one of its panels.
++    static func open(_ url: URL, in owner: AnyObject?) -> Bool {
++        guard ["http", "https"].contains(url.scheme?.lowercased()), let owner else { return false }
++        guard model(for: owner).show(url.absoluteString) else { return false }
++        DockLog.tools.notice("browser: opened \(url.absoluteString, privacy: .public)")
++        return true
++    }
++
++    private static func controller(holding surface: String?) -> TerminalController? {
++        guard let surface, !surface.isEmpty else { return nil }
++        return TerminalController.all.first { c in c.surfaceTree.contains { $0.id.uuidString == surface } }
++    }
++
++    /// A new browser view, Chromium started first if it is not yet.
++    fileprivate static func makeView(url: String) -> NSView? {
++        if newView == nil, let error = start() {
++            DockLog.tools.error("browser: \(error, privacy: .public)")
++            let alert = NSAlert()
++            alert.messageText = "The browser did not start"
++            alert.informativeText = error
++            alert.runModal()
++            return nil
++        }
++        guard let p = newView?(url) else { return nil }
++        return Unmanaged<NSView>.fromOpaque(p).takeRetainedValue()
++    }
++
++    /// Loads and starts Chromium. Nil when it is running, else why not.
++    private static func start() -> String? {
++        let path = frameworks + "/DockBrowser.framework/DockBrowser"
++        guard FileManager.default.fileExists(atPath: path) else { return "This build has no browser in it." }
++        guard let lib = dlopen(path, RTLD_NOW) else { return String(cString: dlerror()) }
++        guard let start = dlsym(lib, "dock_browser_start"), let make = dlsym(lib, "dock_browser_new_view") else {
++            return "DockBrowser.framework is missing its functions."
++        }
++        let cache = FileManager.default.homeDirectoryForCurrentUser
++            .appendingPathComponent(".local/state/ghostty-dock/browser")
++        try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true,
++                                                 attributes: [.posixPermissions: 0o700])
++        let helper = frameworks + "/Ghostty Dock Helper.app/Contents/MacOS/Ghostty Dock Helper"
++        let error = String(cString: unsafeBitCast(start, to: Start.self)(
++            frameworks + "/Chromium Embedded Framework.framework", helper, cache.path, port))
++        guard error.isEmpty else { return error }
++        newView = unsafeBitCast(make, to: NewView.self)
++        NotificationCenter.default.addObserver(forName: adopted, object: nil, queue: .main) { note in
++            guard let view = note.object as? NSView else { return }
++            let url = note.userInfo?["url"] as? String ?? ""
++            MainActor.assumeIsolated { adopt(view, url: url) }
++        }
++        DockLog.tools.info("browser started, debugging port \(port)")
++        return nil
++    }
++
++    /// A page Chromium opened itself (Claude's new_page) becomes the front
++    /// tab of the asking Claude's browser, else the key window's, open or
++    /// hidden as that browser is.
++    private static func adopt(_ view: NSView, url: String) {
++        let recent = asker.flatMap { Date().timeIntervalSince($0.at) < askerSecs ? $0.owner : nil }
++        let key: AnyObject? = recent ?? NSApp.keyWindow?.windowController as? TerminalController
++        guard let owner = key ?? models.values.first(where: { !$0.tabs.isEmpty })?.owner
++                ?? TerminalController.all.first else { return }
++        model(for: owner).adopt(view, url: url)
++    }
++
++    /// What was typed in the address bar, as a URL: "localhost:3000" is
++    /// http, a bare name with a dot is https.
++    static func url(from typed: String) -> String {
++        let t = typed.trimmingCharacters(in: .whitespacesAndNewlines)
++        if t.isEmpty || t.contains("://") || t.hasPrefix("about:") { return t.isEmpty ? "about:blank" : t }
++        let local = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].contains { t.hasPrefix($0) }
++        return (local ? "http://" : "https://") + t
++    }
++}
++
++/// One page of a browser panel.
++@MainActor
++final class DockBrowserTab: ObservableObject, Identifiable {
++    let view: NSView
++    @Published fileprivate(set) var url: String
++    @Published fileprivate(set) var title = ""
++
++    fileprivate init(view: NSView, url: String) {
++        self.view = view
++        self.url = url
++    }
++
++    /// What the tab strip shows: the page's title, else where it is.
++    var label: String {
++        if !title.isEmpty { return title }
++        if url.isEmpty || url == "about:blank" { return "New Tab" }
++        return URL(string: url)?.host ?? url
++    }
++}
++
++/// A terminal tab's browser: its tabs, the one showing, and the address bar.
++@MainActor
++final class DockBrowserModel: ObservableObject {
++    @Published private(set) var open = false
++    @Published private(set) var tabs: [DockBrowserTab] = []
++    @Published private(set) var selected: DockBrowserTab?
++    @Published var address = ""
++    private var observer: NSObjectProtocol?
++    fileprivate weak var owner: BaseTerminalController?
++
++    var title: String { selected?.title ?? "" }
++
++    fileprivate init() {
++        observer = NotificationCenter.default.addObserver(forName: DockBrowser.changed, object: nil,
++                                                          queue: .main) { [weak self] note in
++            let view = note.object as? NSView, info = note.userInfo as? [String: String] ?? [:]
++            MainActor.assumeIsolated { self?.changed(view, info) }
++        }
++    }
++
++    func toggle() {
++        if open { hide() } else { prepare(show: true) }
++    }
++
++    /// A page ready, at the last address when there is none yet; open too
++    /// if `show`. False when Chromium did not start.
++    @discardableResult
++    fileprivate func prepare(show: Bool) -> Bool {
++        if tabs.isEmpty {
++            let start = UserDefaults.standard.string(forKey: DockBrowser.lastAddressKey) ?? "about:blank"
++            guard newTab(url: start) else { return false }
++        }
++        if show { open = true }
++        return true
++    }
++
++    /// A link from the terminal: a new tab at the end, and the browser open.
++    fileprivate func show(_ url: String) -> Bool {
++        guard newTab(url: url) else { return false }
++        open = true
++        return true
++    }
++
++    /// A tab at the end (+), or after `opener` for a link it opened.
++    @discardableResult
++    func newTab(url: String = "about:blank", select: Bool = true, after opener: DockBrowserTab? = nil) -> Bool {
++        guard let view = DockBrowser.makeView(url: url) else { return false }
++        let tab = DockBrowserTab(view: view, url: url)
++        if let opener, let i = tabs.firstIndex(where: { $0 === opener }) {
++            tabs.insert(tab, at: i + 1)
++        } else {
++            tabs.append(tab)
++        }
++        if select || selected == nil { self.select(tab) }
++        return true
++    }
++
++    fileprivate func adopt(_ view: NSView, url: String) {
++        let tab = DockBrowserTab(view: view, url: url)
++        tabs.append(tab)
++        select(tab)
++    }
++
++    func select(_ tab: DockBrowserTab) {
++        // The page going out of sight must not keep the keyboard.
++        if let selected, selected !== tab, hasKeyboard(selected) { returnKeyboard() }
++        selected = tab
++        address = tab.url == "about:blank" ? "" : tab.url
++        if !address.isEmpty { UserDefaults.standard.set(tab.url, forKey: DockBrowser.lastAddressKey) }
++    }
++
++    /// A tab's ×: its page goes, and its Chromium renderer with it. The last
++    /// tab closes the browser.
++    func close(_ tab: DockBrowserTab) {
++        guard let i = tabs.firstIndex(where: { $0 === tab }) else { return }
++        let keyboard = hasKeyboard(tab)
++        tabs.remove(at: i)
++        tab.view.removeFromSuperview()
++        if selected === tab {
++            selected = nil
++            if !tabs.isEmpty { select(tabs[min(i, tabs.count - 1)]) }
++        }
++        if tabs.isEmpty {
++            address = ""
++            if open { open = false; returnKeyboard() }
++        } else if keyboard {
++            returnKeyboard()
++        }
++    }
++
++    /// The bar's ×: every tab goes, and Chromium's renderers with them. ⌘⇧B
++    /// only hides the browser, so Claude can still drive it out of sight.
++    /// Chromium's own helpers stay until the app quits: it starts once per run.
++    func close() {
++        let wasOpen = open
++        tearDown()
++        if wasOpen { returnKeyboard() }
++    }
++
++    func load(_ typed: String) {
++        let url = DockBrowser.url(from: typed)
++        UserDefaults.standard.set(url, forKey: DockBrowser.lastAddressKey)
++        guard let selected else { newTab(url: url); return }
++        selected.view.perform(Selector(("loadURLString:")), with: url)
++    }
++
++    func back() { selected?.view.perform(Selector(("goBack"))) }
++    func forward() { selected?.view.perform(Selector(("goForward"))) }
++    func reload() { selected?.view.perform(Selector(("reload"))) }
++
++    /// Hidden, the page must not keep the keyboard: typing goes back to the
++    /// terminal the browser sits beside.
++    private func hide() {
++        open = false
++        returnKeyboard()
++    }
++
++    private func returnKeyboard() {
++        guard let owner, let window = owner.window,
++              let surface = owner.focusedSurface ?? owner.surfaceTree.first else { return }
++        window.makeFirstResponder(surface)
++    }
++
++    private func hasKeyboard(_ tab: DockBrowserTab) -> Bool {
++        guard let responder = tab.view.window?.firstResponder as? NSView else { return false }
++        return responder.isDescendant(of: tab.view)
++    }
++
++    /// Its terminal tab closed: nothing of it is left.
++    fileprivate func forgotten() {
++        tearDown()
++        observer.map(NotificationCenter.default.removeObserver)
++        observer = nil
++    }
++
++    private func tearDown() {
++        tabs.forEach { $0.view.removeFromSuperview() }
++        tabs = []
++        selected = nil
++        address = ""
++        open = false
++    }
++
++    private func changed(_ view: NSView?, _ info: [String: String]) {
++        guard let tab = tabs.first(where: { $0.view === view }) else { return }
++        if info["closed"] != nil { close(tab); return }
++        if let url = info["popup"] ?? info["background"] {
++            newTab(url: url, select: info["popup"] != nil, after: tab)
++        }
++        if let url = info["url"], url != "about:blank" {
++            tab.url = url
++            if tab === selected {
++                address = url
++                UserDefaults.standard.set(url, forKey: DockBrowser.lastAddressKey)
++            }
++        }
++        if let title = info["title"] { tab.title = title }
++    }
++}
++
++/// The browser's place beside the terminal. Hidden, it keeps its pages, at
++/// no width, so showing it again is instant.
++struct DockBrowserSlot: View {
++    let owner: AnyObject
++    @ObservedObject var model: DockBrowserModel
++    @AppStorage(DockBrowser.widthKey) private var savedWidth: Double = 560
++    /// The width while the handle is dragged, saved when it is let go.
++    @State private var dragWidth: Double?
++
++    private var width: Double { dragWidth ?? savedWidth }
++
++    init(owner: AnyObject) {
++        self.owner = owner
++        self.model = DockBrowser.model(for: owner)
++    }
++
++    var body: some View {
++        HStack(spacing: 0) {
++            if !model.tabs.isEmpty {
++                // Only while open: hidden at no width, its cursor rect would
++                // still sit over the terminal's edge.
++                if model.open {
++                    DockBrowserHandle(width: width,
++                                      onDrag: { dragWidth = $0 },
++                                      onEnd: { if let w = dragWidth { savedWidth = w }; dragWidth = nil })
++                        .frame(width: 7)
++                }
++                VStack(spacing: 0) {
++                    DockBrowserTabStrip(model: model)
++                    DockBrowserBar(model: model)
++                    DockBrowserHost(pages: model.tabs.map(\.view), front: model.selected?.view)
++                }
++            }
++        }
++        .frame(width: model.open && !model.tabs.isEmpty ? width : 0)
++        .clipped()
++        .allowsHitTesting(model.open)
++        .onDisappear { DockBrowser.forget(owner) }
++    }
++}
++
++/// Drag to make the browser (or the file viewer) wider or narrower. An AppKit view, not a
++/// SwiftUI gesture: its cursor rect shows the resize arrow over the
++/// terminal's and Chromium's cursors, and the drag is measured in window
++/// coordinates, which do not move as the handle itself moves.
++struct DockBrowserHandle: NSViewRepresentable {
++    let width: Double
++    let onDrag: (Double) -> Void
++    let onEnd: () -> Void
++
++    func makeNSView(context: Context) -> HandleView { HandleView() }
++
++    func updateNSView(_ view: HandleView, context: Context) {
++        view.width = width
++        view.onDrag = onDrag
++        view.onEnd = onEnd
++    }
++
++    final class HandleView: NSView {
++        var width = 0.0
++        var onDrag: (Double) -> Void = { _ in }
++        var onEnd: () -> Void = {}
++        private var start: (x: CGFloat, width: Double)?
++
++        override var mouseDownCanMoveWindow: Bool { false }
++        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
++
++        // Cursor rects lose to the hosting view's own cursor handling, so the
++        // arrow is set on every move over the handle and through the drag.
++        override func updateTrackingAreas() {
++            super.updateTrackingAreas()
++            trackingAreas.forEach(removeTrackingArea)
++            addTrackingArea(NSTrackingArea(rect: .zero,
++                                           options: [.cursorUpdate, .mouseEnteredAndExited, .mouseMoved,
++                                                     .activeInKeyWindow, .inVisibleRect],
++                                           owner: self))
++        }
++
++        override func cursorUpdate(with event: NSEvent) { NSCursor.resizeLeftRight.set() }
++        override func mouseEntered(with event: NSEvent) { NSCursor.resizeLeftRight.set() }
++        override func mouseMoved(with event: NSEvent) { NSCursor.resizeLeftRight.set() }
++        override func mouseExited(with event: NSEvent) {
++            if start == nil { NSCursor.arrow.set() }
++        }
++
++        override func draw(_ dirtyRect: NSRect) {
++            NSColor.separatorColor.setFill()
++            NSRect(x: bounds.midX - 0.5, y: 0, width: 1, height: bounds.height).fill()
++        }
++
++        override func mouseDown(with event: NSEvent) {
++            start = (event.locationInWindow.x, width)
++        }
++
++        override func mouseDragged(with event: NSEvent) {
++            guard let start else { return }
++            NSCursor.resizeLeftRight.set()
++            let w = start.width - Double(event.locationInWindow.x - start.x)
++            onDrag(min(max(w, 320), 2000))
++        }
++
++        override func mouseUp(with event: NSEvent) {
++            start = nil
++            onEnd()
++            if !bounds.contains(convert(event.locationInWindow, from: nil)) { NSCursor.arrow.set() }
++        }
++    }
++}
++
++
++private struct DockBrowserBar: View {
++    @ObservedObject var model: DockBrowserModel
++    @FocusState private var editing: Bool
++
++    var body: some View {
++        HStack(spacing: 6) {
++            Button(action: model.back) { Image(systemName: "chevron.left") }
++                .help("Back")
++            Button(action: model.forward) { Image(systemName: "chevron.right") }
++                .help("Forward")
++            Button(action: model.reload) { Image(systemName: "arrow.clockwise") }
++                .help("Reload")
++            TextField("Address, e.g. localhost:3000", text: $model.address)
++                .textFieldStyle(.roundedBorder)
++                .focused($editing)
++                .onSubmit { model.load(model.address); editing = false }
++            Button(action: model.close) { Image(systemName: "xmark") }
++                .help("Close the browser and its tabs (⌘⇧B only hides it)")
++        }
++        .buttonStyle(.borderless)
++        .padding(.horizontal, 8)
++        .padding(.vertical, 6)
++        .help(model.title)
++        .onAppear { if model.address.isEmpty { editing = true } }
++        // A new tab starts at the address bar.
++        .onChange(of: model.selected?.id) { _ in if model.address.isEmpty { editing = true } }
++    }
++}
++
++/// Holds Chromium's views, which must stay in the window while their pages
++/// live. Only the front tab is in sight; the others, and all of them while
++/// the browser is hidden (the box at no width), keep their last size out of
++/// sight and are never hidden themselves, so they still draw: Claude can
++/// click and take screenshots of a tab you are not looking at.
++private struct DockBrowserHost: NSViewRepresentable {
++    let pages: [NSView]
++    let front: NSView?
++
++    func makeNSView(context: Context) -> Box { Box() }
++
++    func updateNSView(_ box: Box, context: Context) {
++        for page in pages where page.superview !== box {
++            page.autoresizingMask = []
++            box.addSubview(page)
++        }
++        box.front = front
++        box.needsLayout = true
++    }
++
++    final class Box: NSView {
++        /// The pages' width while open, kept for while it is hidden.
++        private var pageWidth: CGFloat = 560
++        weak var front: NSView?
++
++        override init(frame: NSRect) {
++            super.init(frame: frame)
++            wantsLayer = true
++            layer?.masksToBounds = true
++        }
++
++        required init?(coder: NSCoder) { fatalError("not used") }
++
++        override func layout() {
++            super.layout()
++            if bounds.width > 1 { pageWidth = bounds.width }
++            for page in subviews {
++                page.frame = NSRect(x: page === front ? 0 : pageWidth, y: 0, width: pageWidth, height: bounds.height)
++            }
++        }
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockBrowserTabs.swift b/macos/Sources/Features/Dock/DockBrowserTabs.swift
+new file mode 100644
+index 0000000..4d7dd95
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockBrowserTabs.swift
+@@ -0,0 +1,52 @@
++import SwiftUI
++
++/// The browser's tabs above its address bar: click one to show it, × to
++/// close it, + for a new one. Links that open a new tab or window open here.
++struct DockBrowserTabStrip: View {
++    @ObservedObject var model: DockBrowserModel
++
++    var body: some View {
++        HStack(spacing: 4) {
++            ScrollView(.horizontal, showsIndicators: false) {
++                HStack(spacing: 2) {
++                    ForEach(model.tabs) { tab in
++                        DockBrowserTabButton(tab: tab, selected: tab === model.selected,
++                                             select: { model.select(tab) }, close: { model.close(tab) })
++                    }
++                }
++            }
++            Button { model.newTab() } label: { Image(systemName: "plus") }
++                .buttonStyle(.borderless)
++                .help("New tab")
++        }
++        .padding(.horizontal, 8)
++        .padding(.top, 6)
++    }
++}
++
++private struct DockBrowserTabButton: View {
++    @ObservedObject var tab: DockBrowserTab
++    let selected: Bool
++    let select: () -> Void
++    let close: () -> Void
++
++    var body: some View {
++        HStack(spacing: 4) {
++            Text(tab.label)
++                .lineLimit(1)
++                .truncationMode(.tail)
++                .frame(maxWidth: 160, alignment: .leading)
++            Button(action: close) { Image(systemName: "xmark").font(.system(size: 9, weight: .semibold)) }
++                .buttonStyle(.borderless)
++                .help("Close this tab")
++        }
++        .font(.system(size: 11))
++        .padding(.horizontal, 8)
++        .padding(.vertical, 4)
++        .background(RoundedRectangle(cornerRadius: 5)
++            .fill(selected ? Color.primary.opacity(0.12) : Color.clear))
++        .contentShape(Rectangle())
++        .onTapGesture(perform: select)
++        .help(tab.url)
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockBypass.swift b/macos/Sources/Features/Dock/DockBypass.swift
+new file mode 100644
+index 0000000..81d3ee9
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockBypass.swift
+@@ -0,0 +1,47 @@
++import Foundation
++
++/// Every session starts with --dangerously-skip-permissions, as
++/// ghostty-claude-launcher starts them, unless CLAUDE_PANEL_BYPASS_PERMISSIONS
++/// is off in ~/.config/claude-panel/options or the flags already pick a mode.
++enum DockBypass {
++    static func flags(_ flags: String) -> String {
++        guard enabled else { return flags }
++        let words = flags.split(separator: " ")
++        if words.contains(where: { $0 == "--dangerously-skip-permissions" || $0.hasPrefix("--permission-mode") }) {
++            return flags
++        }
++        return flags.isEmpty ? "--dangerously-skip-permissions" : "--dangerously-skip-permissions " + flags
++    }
++
++    private static var path: String {
++        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/claude-panel/options").path
++    }
++    private static let key = "CLAUDE_PANEL_BYPASS_PERMISSIONS"
++
++    /// Writes the choice to the options file, which ghostty-claude-launcher
++    /// and the restart scripts read too, replacing any line it had.
++    static func set(_ on: Bool) {
++        let old = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
++        var lines = old.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
++        if lines.last == "" { lines.removeLast() }
++        let line = "\(key)=\(on)"
++        if let i = lines.firstIndex(where: { $0.hasPrefix(key + "=") }) {
++            lines[i] = line
++            lines.removeAll { $0.hasPrefix(key + "=") && $0 != line }
++        } else {
++            lines += ["# \(key): start sessions with --dangerously-skip-permissions", line]
++        }
++        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
++                                                 withIntermediateDirectories: true)
++        try? (lines.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
++    }
++
++    static var enabled: Bool {
++        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
++              let line = text.split(separator: "\n").last(where: { $0.hasPrefix("CLAUDE_PANEL_BYPASS_PERMISSIONS=") })
++        else { return true }
++        let v = line.dropFirst("CLAUDE_PANEL_BYPASS_PERMISSIONS=".count)
++            .filter { !"\"' ".contains($0) }.lowercased()
++        return !["false", "0", "no", "off"].contains(v)
++    }
++}
 diff --git a/macos/Sources/Features/Dock/DockCenteredTitle.swift b/macos/Sources/Features/Dock/DockCenteredTitle.swift
 new file mode 100644
 index 0000000..38589ea
@@ -3977,10 +4646,10 @@ index 0000000..fee8caa
 +}
 diff --git a/macos/Sources/Features/Dock/DockHistory.swift b/macos/Sources/Features/Dock/DockHistory.swift
 new file mode 100644
-index 0000000..3cb8d8e
+index 0000000..1a3f9cd
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockHistory.swift
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,470 @@
 +import AppKit
 +import SwiftUI
 +
@@ -4224,12 +4893,17 @@ index 0000000..3cb8d8e
 +    @ObservedObject private var model = DockSessions.shared
 +    @AppStorage("dock.history.open") private var open = false
 +    @AppStorage("dock.history.height") private var height = 280.0
++    @AppStorage("dock.history.oldestFirst") private var oldestFirst = false
 +    @State private var query = ""
 +    @State private var dragStart: Double?
 +    @State private var pending: DispatchWorkItem?
++    /// Whether the pointer is over the panel, so a click elsewhere closes it.
++    @State private var inside = false
++    @State private var clickMonitor: Any?
 +
 +    var body: some View {
-+        let shown = history.shown(query, open: Set(model.rows.compactMap(\.sessionId)))
++        let newest = history.shown(query, open: Set(model.rows.compactMap(\.sessionId)))
++        let shown = oldestFirst ? Array(newest.reversed()) : newest
 +        // Open sessions in which it was said: a click goes to the tab.
 +        let openNow = query.isEmpty ? [] : model.rows.filter { $0.sessionId.map { history.said[$0] != nil } == true }
 +        VStack(spacing: 0) {
@@ -4248,6 +4922,13 @@ index 0000000..3cb8d8e
 +                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
 +                            .buttonStyle(.plain).foregroundStyle(DockPalette.grey)
 +                    }
++                    Button { oldestFirst.toggle() } label: {
++                        Image(systemName: "arrow.up.arrow.down")
++                            .font(.system(size: 11, weight: .semibold))
++                            .foregroundStyle(oldestFirst ? DockPalette.teal : DockPalette.grey)
++                    }
++                    .buttonStyle(.plain)
++                    .dockTip(oldestFirst ? "Oldest first: click for newest first" : "Newest first: click for oldest first")
 +                }
 +                .padding(.horizontal, 8).padding(.vertical, 5)
 +                .background(RoundedRectangle(cornerRadius: 6).fill(DockPalette.base))
@@ -4257,6 +4938,24 @@ index 0000000..3cb8d8e
 +        }
 +        .background(DockPalette.mantle)
 +        .overlay(alignment: .top) { Rectangle().fill(DockPalette.greyLine).frame(height: 1) }
++        .onHover { inside = $0 }
++        .onAppear { watchClicks() }
++        .onDisappear {
++            if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
++            clickMonitor = nil
++        }
++    }
++
++    /// A click anywhere else in the window (a tab, the terminal) folds the
++    /// list away, as a popover would.
++    private func watchClicks() {
++        guard clickMonitor == nil else { return }
++        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { e in
++            if open, !inside, e.window?.isKeyWindow == true || e.window?.isMainWindow == true {
++                withAnimation(.easeOut(duration: 0.15)) { open = false }
++            }
++            return e
++        }
 +    }
 +
 +    private func bar(count: Int) -> some View {
@@ -4621,27 +5320,76 @@ index 0000000..db9ed48
 +        return CGPath(roundedRect: inset, cornerWidth: r, cornerHeight: r, transform: nil)
 +    }
 +}
+diff --git a/macos/Sources/Features/Dock/DockLayout.swift b/macos/Sources/Features/Dock/DockLayout.swift
+new file mode 100644
+index 0000000..dd98e55
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockLayout.swift
+@@ -0,0 +1,40 @@
++import AppKit
++
++/// Ghostty Dock: the splits of every tab that has them, in layout.json
++/// beside the other state, so a restart puts the terminals of a split tab
++/// back side by side instead of each in a tab of its own
++/// (ghostty-dock-restart reads it).
++///
++/// Each tab is its split tree: a terminal is {"s": "<surface id>"}, the id
++/// in GHOSTTY_DOCK_SURFACE and hold/<name>.surface; a split is
++/// {"d": "right" | "down", "l": ..., "r": ...}.
++enum DockLayout {
++    static let file = FileManager.default.homeDirectoryForCurrentUser
++        .appendingPathComponent(".local/state/ghostty-dock/layout.json")
++
++    private static var written: Data?
++
++    /// Writes layout.json when the splits have changed since the last time.
++    static func save() {
++        let tabs = NSApp.windows.compactMap { ($0.windowController as? TerminalController)?.surfaceTree.root }
++            .filter { if case .split = $0 { return true } else { return false } }
++            .map(node)
++        guard let data = try? JSONSerialization.data(withJSONObject: ["tabs": tabs], options: [.sortedKeys]),
++              data != written else { return }
++        do {
++            try data.write(to: file, options: .atomic)
++            written = data
++        } catch {
++            DockLog.restart.error("could not save the tabs' splits: \(error.localizedDescription)")
++        }
++    }
++
++    private static func node(_ n: SplitTree<Ghostty.SurfaceView>.Node) -> [String: Any] {
++        switch n {
++        case .leaf(let view):
++            return ["s": view.id.uuidString]
++        case .split(let s):
++            return ["d": s.direction == .horizontal ? "right" : "down", "l": node(s.left), "r": node(s.right)]
++        }
++    }
++}
 diff --git a/macos/Sources/Features/Dock/DockLoadingView.swift b/macos/Sources/Features/Dock/DockLoadingView.swift
 new file mode 100644
-index 0000000..dad1607
+index 0000000..b9cfd97
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockLoadingView.swift
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,84 @@
 +import AppKit
 +import SwiftUI
 +
 +/// The Loading… screen over a terminal window while it lasts. Its own view,
 +/// so the sidebar's every change doesn't redraw the window's terminals.
++/// Watches only `loading`: observing the model redrew every window's
++/// terminal view at each of its changes.
 +struct DockLoadingOverlay: View {
-+    @ObservedObject private var model = DockSessions.shared
++    @State private var loading = DockSessions.shared.loading
 +
 +    var body: some View {
 +        ZStack {
-+            if model.loading {
++            if loading {
 +                DockLoadingView().transition(.opacity)
 +            }
 +        }
-+        .animation(.easeOut(duration: 0.4), value: model.loading)
++        .animation(.easeOut(duration: 0.4), value: loading)
++        .onReceive(DockSessions.shared.$loading.removeDuplicates()) { loading = $0 }
 +    }
 +}
 +
@@ -4946,10 +5694,10 @@ index 0000000..6d9cbd4
 +}
 diff --git a/macos/Sources/Features/Dock/DockLogin.swift b/macos/Sources/Features/Dock/DockLogin.swift
 new file mode 100644
-index 0000000..d9a1f65
+index 0000000..532f7df
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockLogin.swift
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,216 @@
 +import AppKit
 +import Combine
 +
@@ -4977,10 +5725,22 @@ index 0000000..d9a1f65
 +        set { UserDefaults.standard.set(newValue, forKey: Self.changedKey) }
 +    }
 +
++    /// Whether Claude Code can run here at all: installed, and logged in
++    /// (an API key or a cloud provider counts). Nil until first asked.
++    enum Access: Equatable { case ready, signedOut, missing }
++    @Published private(set) var access: Access?
++    private var accessAt: Date?
++    private var accessFor: Date?
++    private var asking = false
++
 +    func start() {
 +        guard timer == nil else { return }
 +        check()
-+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.check() }
++        checkAccess()
++        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
++            self?.check()
++            self?.checkAccess()
++        }
 +        DockSessions.shared.$rows
 +            .throttle(for: .seconds(2), scheduler: RunLoop.main, latest: true)
 +            .sink { [weak self] _ in self?.findStale() }
@@ -5014,6 +5774,72 @@ index 0000000..d9a1f65
 +                self.findStale()
 +            }
 +        }
++    }
++
++    /// Asks claude auth status in your login shell, so its PATH and any
++    /// ANTHROPIC_API_KEY count: at launch, then every 30 seconds (or when
++    /// ~/.claude.json, which a login writes, changes) until it's ready.
++    private func checkAccess(force: Bool = false) {
++        guard !asking else { return }
++        let m = (try? FileManager.default.attributesOfItem(atPath: configURL.path))?[.modificationDate] as? Date
++        // claude rewrites ~/.claude.json often: once ready, only notice a
++        // logout every few minutes, so a shell isn't started for each write.
++        let since = Date().timeIntervalSince(accessAt ?? .distantPast)
++        let due = force || accessAt == nil
++            || (access == .ready ? m != accessFor && since > 300 : m != accessFor || since > 30)
++        guard due else { return }
++        asking = true
++        DispatchQueue.global(qos: .utility).async { [weak self] in
++            let found = Self.askAccess()
++            DispatchQueue.main.async {
++                guard let self else { return }
++                self.asking = false
++                self.accessAt = Date()
++                self.accessFor = m
++                // A shell that failed or timed out tells nothing: keep what we had.
++                guard let found else { return }
++                if found != self.access {
++                    DockLog.sessions.notice("Claude access: \(String(describing: found), privacy: .public)")
++                    self.access = found
++                }
++            }
++        }
++    }
++
++    private static func askAccess() -> Access? {
++        let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
++        // Where the installers put it, in case the shell's PATH doesn't say.
++        let script = """
++            PATH="$PATH:$HOME/.local/bin:$HOME/.claude/local:/opt/homebrew/bin:/usr/local/bin"
++            command -v claude >/dev/null 2>&1 || { echo GHOSTTY_DOCK_NO_CLAUDE; exit 0; }
++            claude auth status --json 2>/dev/null
++            """
++        guard let r = DockProcess.run(shell, ["-ilc", script], timeout: 20, quiet: [1]) else { return nil }
++        let text = r.text
++        if text.contains("GHOSTTY_DOCK_NO_CLAUDE") { return .missing }
++        // An interactive shell may print a greeting first.
++        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end,
++              let json = try? JSONSerialization.jsonObject(with: Data(text[start...end].utf8)) as? [String: Any]
++        else { return nil }
++        if json["loggedIn"] as? Bool == true { return .ready }
++        if let provider = json["apiProvider"] as? String, provider != "firstParty" { return .ready }
++        return .signedOut
++    }
++
++    /// A tab that runs claude auth login (or installs Claude Code first),
++    /// in your shell: the browser opens to sign in, and the tab stays for
++    /// whatever it asks.
++    func logIn() {
++        guard let ghostty = (NSApp.delegate as? AppDelegate)?.ghostty else { NSSound.beep(); return }
++        var config = Ghostty.SurfaceConfiguration()
++        config.workingDirectory = FileManager.default.homeDirectoryForCurrentUser.path
++        config.initialInput = access == .missing
++            ? "curl -fsSL https://claude.ai/install.sh | bash && ~/.local/bin/claude auth login\n"
++            : "claude auth login\n"
++        let window = NSApp.keyWindow ?? NSApp.windows.first { $0.windowController is TerminalController }
++        _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config)
++        // Look again soon after, rather than on the 30-second beat.
++        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.checkAccess(force: true) }
 +    }
 +
 +    private func findStale() {
@@ -5073,9 +5899,11 @@ index 0000000..d9a1f65
 +        case .alertSecondButtonReturn where !busy.isEmpty: chosen = rows
 +        default: return
 +        }
-+        for (i, row) in chosen.enumerated() {
-+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.5) {
-+                DockSessions.shared.restart(row)
++        DockSessions.shared.whenTabsOpen {
++            for (i, row) in chosen.enumerated() {
++                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.5) {
++                    DockSessions.shared.restart(row)
++                }
 +            }
 +        }
 +    }
@@ -5720,6 +6548,259 @@ index 0000000..ddb67af
 +        window?.makeKeyAndOrderFront(nil)
 +    }
 +}
+diff --git a/macos/Sources/Features/Dock/DockPrompts.swift b/macos/Sources/Features/Dock/DockPrompts.swift
+new file mode 100644
+index 0000000..15fd2f3
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockPrompts.swift
+@@ -0,0 +1,247 @@
++import AppKit
++import SwiftUI
++
++/// What you typed to a session, oldest first, from its transcript. Opened
++/// from a row's View Prompts.
++final class DockPromptsModel: ObservableObject {
++    struct Prompt: Identifiable, Equatable {
++        let id: Int
++        let at: Date?
++        let text: String
++        /// Images pasted with it.
++        let images: Int
++    }
++
++    @Published var name = ""
++    @Published var prompts: [Prompt] = []
++    @Published var loading = false
++    @Published var error: String?
++    private var sessionId: String?
++    private var generation = 0
++
++    func load(sessionId: String?, name: String) {
++        self.sessionId = sessionId
++        self.name = name
++        prompts = []
++        refresh()
++    }
++
++    func refresh() {
++        generation += 1
++        let gen = generation
++        guard let sid = sessionId, let url = DockSessions.shared.transcriptURL(sid) else {
++            prompts = []
++            error = "No transcript for this session yet."
++            return
++        }
++        loading = true
++        DispatchQueue.global(qos: .userInitiated).async {
++            let found = Self.prompts(in: url)
++            DispatchQueue.main.async {
++                guard gen == self.generation else { return }
++                self.loading = false
++                self.error = found == nil ? "Could not read the transcript." : nil
++                self.prompts = found ?? []
++            }
++        }
++    }
++
++    private static let stamp: ISO8601DateFormatter = {
++        let f = ISO8601DateFormatter()
++        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++        return f
++    }()
++
++    /// The user lines that are prompts: not tool results, subagents, meta
++    /// lines, compaction summaries or command output.
++    static func prompts(in url: URL) -> [Prompt]? {
++        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
++        var out: [Prompt] = []
++        for line in data.split(separator: UInt8(ascii: "\n")) {
++            // Most lines are not the user's; skip them before parsing.
++            guard line.range(of: Data("\"type\":\"user\"".utf8)) != nil,
++                  let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
++                  o["type"] as? String == "user",
++                  o["isMeta"] as? Bool != true, o["isSidechain"] as? Bool != true,
++                  o["isCompactSummary"] as? Bool != true,
++                  let message = o["message"] as? [String: Any] else { continue }
++            var text = "", images = 0
++            if let s = message["content"] as? String {
++                text = s
++            } else if let parts = message["content"] as? [[String: Any]] {
++                for p in parts {
++                    switch p["type"] as? String {
++                    case "text": text += (text.isEmpty ? "" : "\n") + (p["text"] as? String ?? "")
++                    case "image": images += 1
++                    default: break
++                    }
++                }
++            }
++            guard let shown = shown(text), !shown.isEmpty || images > 0 else { continue }
++            out.append(Prompt(id: out.count, at: (o["timestamp"] as? String).flatMap(stamp.date(from:)),
++                              text: shown, images: images))
++        }
++        return out
++    }
++
++    /// The prompt as you typed it: a slash command as "/name args", and nil
++    /// for what Claude Code wrote itself.
++    private static func shown(_ text: String) -> String? {
++        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
++        if t.hasPrefix("[Request interrupted") { return nil }
++        if t.hasPrefix("<command-name>") || t.hasPrefix("<command-message>") {
++            guard let name = tag("command-name", in: t) else { return nil }
++            let args = tag("command-args", in: t) ?? ""
++            return args.isEmpty ? name : "\(name) \(args)"
++        }
++        if t.hasPrefix("<local-command") || t.hasPrefix("<system-reminder>")
++            || t.hasPrefix("<bash-") || t.hasPrefix("<task-notification>") { return nil }
++        return pastes(t)
++    }
++
++    /// Text pasted into the prompt, as Claude Code shows it: a line, not the paste.
++    private static func pastes(_ text: String) -> String {
++        var out = text
++        // The closing tag carries the id too: </pasted_content id="…">.
++        while let a = out.range(of: "<pasted_content"),
++              let close = out.range(of: "</pasted_content", range: a.upperBound..<out.endIndex),
++              let b = out.range(of: ">", range: close.upperBound..<out.endIndex) {
++            let body = out[a.upperBound..<close.lowerBound]
++            let lines = body.split(separator: "\n", omittingEmptySubsequences: false).count - 1
++            out.replaceSubrange(a.lowerBound..<b.upperBound, with: "[Pasted text, \(max(lines, 1)) lines]")
++        }
++        return out.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    private static func tag(_ name: String, in text: String) -> String? {
++        guard let a = text.range(of: "<\(name)>"),
++              let b = text.range(of: "</\(name)>", range: a.upperBound..<text.endIndex) else { return nil }
++        return text[a.upperBound..<b.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++}
++
++struct DockPromptsView: View {
++    @ObservedObject var model: DockPromptsModel
++    @State private var query = ""
++    @State private var copied: Int?
++
++    var body: some View {
++        let shown = query.isEmpty ? model.prompts
++            : model.prompts.filter { $0.text.localizedCaseInsensitiveContains(query) }
++        VStack(spacing: 0) {
++            HStack(spacing: 8) {
++                VStack(alignment: .leading, spacing: 2) {
++                    Text(model.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
++                    Text(summary).font(.system(size: 11)).foregroundStyle(DockPalette.grey)
++                }
++                Spacer()
++                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(DockPalette.grey)
++                TextField("Filter", text: $query).textFieldStyle(.plain).font(.system(size: 12)).frame(width: 160)
++                Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }
++                    .buttonStyle(.plain).help("Refresh")
++                    .keyboardShortcut("r", modifiers: .command)
++            }
++            .foregroundStyle(DockPalette.text)
++            .padding(10)
++            Divider()
++            if let error = model.error {
++                Text(error).font(.system(size: 12)).foregroundStyle(DockPalette.grey).padding(10)
++                Spacer()
++            } else if shown.isEmpty && !model.loading {
++                Text(query.isEmpty ? "No prompts yet." : "No prompt has \"\(query)\".")
++                    .font(.system(size: 12)).foregroundStyle(DockPalette.grey).padding(10)
++                Spacer()
++            } else {
++                ScrollViewReader { proxy in
++                    ScrollView {
++                        LazyVStack(alignment: .leading, spacing: 0) {
++                            ForEach(Array(shown.enumerated()), id: \.element.id) { i, p in
++                                row(p, day: i == 0 || !Self.sameDay(shown[i - 1].at, p.at))
++                            }
++                        }
++                        .padding(.vertical, 8)
++                    }
++                    // The latest first in view, as in the terminal.
++                    .onAppear { proxy.scrollTo(shown.last?.id, anchor: .bottom) }
++                    .onChange(of: model.prompts) { _ in proxy.scrollTo(model.prompts.last?.id, anchor: .bottom) }
++                }
++            }
++        }
++        .background(DockPalette.base)
++        .environment(\.colorScheme, DockPalette.scheme)
++    }
++
++    private var summary: String {
++        let n = model.prompts.count
++        guard let first = model.prompts.first?.at else { return model.loading ? "Loading…" : "\(n) prompts" }
++        return "\(n) prompt\(n == 1 ? "" : "s") since " + first.formatted(date: .abbreviated, time: .shortened)
++    }
++
++    @ViewBuilder
++    private func row(_ p: DockPromptsModel.Prompt, day: Bool) -> some View {
++        if day, let at = p.at {
++            Text(at.formatted(date: .complete, time: .omitted))
++                .font(.system(size: 11, weight: .semibold)).foregroundStyle(DockPalette.grey)
++                .padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 4)
++        }
++        HStack(alignment: .top, spacing: 10) {
++            // The timeline: a dot per prompt on a line.
++            VStack(spacing: 0) {
++                Circle().fill(DockPalette.blue).frame(width: 7, height: 7).padding(.top, 5)
++                Rectangle().fill(DockPalette.grey.opacity(0.3)).frame(width: 1)
++            }
++            .frame(width: 7)
++            Text(p.at.map { $0.formatted(date: .omitted, time: .shortened) } ?? "")
++                .font(.system(size: 11, design: .monospaced)).foregroundStyle(DockPalette.grey)
++                .frame(width: 64, alignment: .leading).padding(.top, 1)
++            VStack(alignment: .leading, spacing: 3) {
++                Text(p.text.isEmpty ? "(image)" : p.text)
++                    .font(.system(size: 12.5)).foregroundStyle(DockPalette.text)
++                    .textSelection(.enabled)
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                if p.images > 0 {
++                    Label("\(p.images) image\(p.images == 1 ? "" : "s")", systemImage: "photo")
++                        .font(.system(size: 10.5)).foregroundStyle(DockPalette.grey)
++                }
++            }
++            Button {
++                NSPasteboard.general.clearContents()
++                NSPasteboard.general.setString(p.text, forType: .string)
++                copied = p.id
++            } label: {
++                Image(systemName: copied == p.id ? "checkmark" : "doc.on.doc").font(.system(size: 11))
++            }
++            .buttonStyle(.plain).foregroundStyle(DockPalette.grey).help("Copy")
++        }
++        .padding(.horizontal, 14).padding(.bottom, 10)
++        .id(p.id)
++    }
++
++    private static func sameDay(_ a: Date?, _ b: Date?) -> Bool {
++        guard let a, let b else { return true }
++        return Calendar.current.isDate(a, inSameDayAs: b)
++    }
++}
++
++/// The prompts in their own window, reused for whichever session asks.
++final class DockPromptsWindow {
++    static let shared = DockPromptsWindow()
++    private var window: NSWindow?
++    private let model = DockPromptsModel()
++
++    func show(sessionId: String?, name: String) {
++        model.load(sessionId: sessionId, name: name)
++        if window == nil {
++            let w = NSWindow(contentViewController: NSHostingController(rootView: DockPromptsView(model: model)))
++            w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
++            w.isReleasedWhenClosed = false
++            w.setContentSize(NSSize(width: 720, height: 640))
++            w.setFrameAutosaveName("GhosttyDockPrompts")
++            if !w.setFrameUsingName("GhosttyDockPrompts") { w.center() }
++            window = w
++        }
++        window?.title = "Prompts in \(name)"
++        NSApp.activate(ignoringOtherApps: true)
++        window?.makeKeyAndOrderFront(nil)
++    }
++}
 diff --git a/macos/Sources/Features/Dock/DockRaiseBanner.swift b/macos/Sources/Features/Dock/DockRaiseBanner.swift
 new file mode 100644
 index 0000000..9b29fc8
@@ -5861,12 +6942,13 @@ index 0000000..9b29fc8
 +}
 diff --git a/macos/Sources/Features/Dock/DockRecap.swift b/macos/Sources/Features/Dock/DockRecap.swift
 new file mode 100644
-index 0000000..430e17d
+index 0000000..ea97919
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockRecap.swift
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,486 @@
 +import AppKit
 +import SwiftUI
++import UniformTypeIdentifiers
 +
 +/// Ghostty Dock: what a day's Claude Code sessions did, per repo: spend,
 +/// prompts, how long Claude worked, the files it changed and the commits
@@ -6173,12 +7255,61 @@ index 0000000..430e17d
 +                .help("The day after")
 +            Spacer()
 +            if model.loading && model.day != nil { ProgressView().controlSize(.small) }
++            Button { savePDF() } label: { Image(systemName: "doc.richtext") }
++                .disabled(model.day?.projects.isEmpty != false)
++                .help("Save this day's recap as a PDF")
 +            Button { model.load() } label: { Image(systemName: "arrow.clockwise") }
 +                .help("Read the sessions again")
 +        }
 +        .buttonStyle(.borderless)
 +        .padding(.horizontal, 16)
 +        .padding(.vertical, 10)
++    }
++
++    /// The recap as A4 pages: the title, the totals and every project, cut
++    /// across pages where it runs over. Saved where you choose, then opened.
++    @MainActor private func savePDF() {
++        guard let day = model.day else { return }
++        let page = CGSize(width: 595, height: 842), margin: CGFloat = 36
++        let width = page.width - 2 * margin
++        let content = VStack(alignment: .leading, spacing: 14) {
++            Text("Daily Recap · \(title)").font(.title3.weight(.semibold)).foregroundStyle(DockPalette.text)
++            totals(day)
++            ForEach(day.projects) { project($0) }
++        }
++        .frame(width: width, alignment: .leading)
++        .background(DockPalette.base)
++        .environment(\.colorScheme, DockPalette.scheme)
++
++        let day8601 = ISO8601DateFormatter()
++        day8601.formatOptions = [.withFullDate]
++        let panel = NSSavePanel()
++        panel.allowedContentTypes = [.pdf]
++        panel.nameFieldStringValue = "Daily Recap \(day8601.string(from: model.start)).pdf"
++        guard panel.runModal() == .OK, let url = panel.url else { return }
++
++        let renderer = ImageRenderer(content: content)
++        renderer.proposedSize = ProposedViewSize(width: width, height: nil)
++        var box = CGRect(origin: .zero, size: page)
++        guard let ctx = CGContext(url as CFURL, mediaBox: &box, nil) else { NSSound.beep(); return }
++        renderer.render { size, draw in
++            let usable = page.height - 2 * margin
++            let pages = max(1, Int((size.height / usable).rounded(.up)))
++            for i in 0..<pages {
++                ctx.beginPDFPage(nil)
++                ctx.setFillColor(NSColor(DockPalette.base).cgColor)
++                ctx.fill(CGRect(origin: .zero, size: page))
++                ctx.saveGState()
++                ctx.clip(to: CGRect(x: margin, y: margin, width: width, height: usable))
++                // PDF space runs upward: page i shows the slice i * usable from the top.
++                ctx.translateBy(x: margin, y: page.height - margin - size.height + CGFloat(i) * usable)
++                draw(ctx)
++                ctx.restoreGState()
++                ctx.endPDFPage()
++            }
++        }
++        ctx.closePDF()
++        NSWorkspace.shared.open(url)
 +    }
 +
 +    private var title: String {
@@ -6301,9 +7432,60 @@ index 0000000..430e17d
 +        window?.makeKeyAndOrderFront(nil)
 +    }
 +}
+diff --git a/macos/Sources/Features/Dock/DockScripts.swift b/macos/Sources/Features/Dock/DockScripts.swift
+new file mode 100644
+index 0000000..0abffdd
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockScripts.swift
+@@ -0,0 +1,45 @@
++import Darwin
++import Foundation
++
++/// Commands a Claude session left running in the background: a script it
++/// started with run_in_background and is waiting on. Its turn has ended, so
++/// the session reads as idle, but it will carry on when the script finishes.
++///
++/// Claude runs every Bash command as a direct child,
++/// `/bin/zsh -c source ~/.claude/shell-snapshots/... && eval '...'`; its MCP
++/// servers and caffeinate are children too but never look like that. While
++/// a turn runs that is just the command in front; once the turn is over,
++/// any still alive were left running.
++enum DockScripts {
++    private static var cache: [Int32: (at: Date, count: Int)] = [:]
++
++    /// How many background commands `pid` has, checked at most every 5 s.
++    static func count(_ pid: Int32) -> Int {
++        if let c = cache[pid], Date().timeIntervalSince(c.at) < 5 { return c.count }
++        let n = children(of: pid).filter { isClaudeShell(args($0)) }.count
++        cache[pid] = (Date(), n)
++        return n
++    }
++
++    static func isClaudeShell(_ command: String) -> Bool {
++        command.contains("/.claude/shell-snapshots/")
++    }
++
++    private static func children(of pid: Int32) -> [Int32] {
++        var buf = [pid_t](repeating: 0, count: 256)
++        let n = proc_listchildpids(pid, &buf, Int32(buf.count * MemoryLayout<pid_t>.size))
++        guard n > 0 else { return [] }
++        return Array(buf.prefix(Int(n)))
++    }
++
++    /// The process's arguments, joined by spaces.
++    private static func args(_ pid: Int32) -> String {
++        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
++        var size = 0
++        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return "" }
++        var buf = [UInt8](repeating: 0, count: size)
++        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return "" }
++        // argc, then the executable path, then NUL-separated arguments.
++        return String(decoding: buf[4..<size].map { $0 == 0 ? 0x20 : $0 }, as: UTF8.self)
++    }
++}
 diff --git a/macos/Sources/Features/Dock/DockSearch.swift b/macos/Sources/Features/Dock/DockSearch.swift
 new file mode 100644
-index 0000000..2b66815
+index 0000000..764cc07
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSearch.swift
 @@ -0,0 +1,230 @@
@@ -6409,7 +7591,7 @@ index 0000000..2b66815
 +                let fields: [String]
 +                switch h {
 +                case .row(let r): fields = [r.name, r.detail, r.prompt ?? "", r.tag?.label ?? ""]
-+                case .undocked(let u): fields = [u.name, u.cwd]
++                case .undocked(let u): fields = [u.name, u.cwd] + u.programs
 +                case .closed(let c): fields = [c.name, c.folder]
 +                }
 +                let scores = fields.compactMap { Self.score(q, in: $0) }
@@ -6539,10 +7721,10 @@ index 0000000..2b66815
 +}
 diff --git a/macos/Sources/Features/Dock/DockSessions.swift b/macos/Sources/Features/Dock/DockSessions.swift
 new file mode 100644
-index 0000000..3d20550
+index 0000000..cb11b6a
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSessions.swift
-@@ -0,0 +1,1611 @@
+@@ -0,0 +1,1879 @@
 +import AppKit
 +import Combine
 +import UserNotifications
@@ -6595,7 +7777,12 @@ index 0000000..3d20550
 +        var pid: Int32?
 +        /// A child terminal's parent row: it is listed just under it.
 +        var parent: String?
++        /// Commands it left running in the background after its turn ended.
++        var scripts = 0
 +        weak var controller: TerminalController?
++
++        /// Its turn is over but it is waiting on a script it started.
++        var scripting: Bool { scripts > 0 && (status == .idle || status == .unread) }
 +
 +        static func == (a: Row, b: Row) -> Bool {
 +            a.id == b.id && a.key == b.key && a.name == b.name && a.detail == b.detail && a.status == b.status
@@ -6603,7 +7790,7 @@ index 0000000..3d20550
 +                && a.started == b.started && a.project == b.project && a.prompt == b.prompt
 +                && a.ask == b.ask && a.askSurface == b.askSurface
 +                && a.pinned == b.pinned && a.tag == b.tag && a.hatch == b.hatch && a.renamed == b.renamed
-+                && a.failed == b.failed && a.pid == b.pid && a.parent == b.parent
++                && a.failed == b.failed && a.pid == b.pid && a.parent == b.parent && a.scripts == b.scripts
 +        }
 +    }
 +
@@ -6632,7 +7819,9 @@ index 0000000..3d20550
 +        var flags = ""
 +    }
 +
-+    /// A Claude Code session running in a stock Ghostty app of its own.
++    /// A Claude Code session running in a stock Ghostty app of its own, or a
++    /// stock Ghostty with only shells in it (`shell`), which docks as shell
++    /// tabs once what its tabs run has finished.
 +    struct Undocked: Identifiable, Equatable {
 +        var id: Int32 { pid }
 +        let pid: Int32
@@ -6640,6 +7829,10 @@ index 0000000..3d20550
 +        var cwd: String
 +        var busy: Bool
 +        var moving: Bool
++        var shell = false
++        var tabs = 0
++        /// What a shell-only Ghostty's tabs run, besides their shells.
++        var programs: [String] = []
 +    }
 +
 +    /// Every row, in the order shown, groups flattened.
@@ -6657,6 +7850,11 @@ index 0000000..3d20550
 +    /// Row key to its folder's git branch, pull request and ports.
 +    @Published private(set) var workspaces: [String: DockWorkspace] = [:]
 +    private let workspaceMeter = DockWorkspaces()
++    private var remoteTimer: Timer?
++    private var staleTimer: Timer?
++    /// Sessions already resumed out of an ended login, once each.
++    private var staleResumed: Set<String> = []
++    private var remoteLooking = false
 +    /// Sessions sent /compact-async a moment ago.
 +    @Published private(set) var compacting: Set<String> = []
 +    @Published private(set) var meta: [String: Meta] = [:]
@@ -6708,7 +7906,7 @@ index 0000000..3d20550
 +    /// Undocked sessions whose name or folder has the search.
 +    var shownUndocked: [Undocked] {
 +        let term = searchTerm
-+        return term.isEmpty ? undocked : undocked.filter { matches(term, $0.name, $0.cwd) }
++        return term.isEmpty ? undocked : undocked.filter { matches(term, $0.name, $0.cwd, $0.programs.joined(separator: " ")) }
 +    }
 +
 +    private func matches(_ term: String, _ fields: String...) -> Bool {
@@ -6757,6 +7955,18 @@ index 0000000..3d20550
 +    /// Child terminals (a plain shell opened from a session's menu), and the
 +    /// key of the row each sits under.
 +    private var children: [ObjectIdentifier: String] = [:]
++    /// The same, kept across a restart: a held terminal's holder name (it
++    /// survives; the tab and surface do not) to its parent's key.
++    private lazy var savedChildren: [String: String] = Self.loadChildren()
++    private var holdNamesAt: Date?
++    /// The tab that was selected when the app last ran, put back once a
++    /// restart has reopened the tabs: until then the last tab opened won.
++    private lazy var selectionToRestore: [String: Any]? = DockSessions.loadSelection()
++    private let launchedAt = Date()
++    private var tabCount = 0
++    private var tabCountSince = Date()
++    private var savedSelection: String?
++    private var holdNames: [String: String] = [:]
 +    private var moveTimer: Timer?
 +    private var watcher: DispatchSourceFileSystemObject?
 +    private var jumpKey: DockHotKey?
@@ -6804,6 +8014,9 @@ index 0000000..3d20550
 +    private var done: Set<String> = []
 +    /// Of those, the ones whose screen shows it working again: running.
 +    private var resumed: Set<String> = []
++    /// The hook's session files as last read, by path, with their change
++    /// date: refresh, twice a second, decodes only those that changed.
++    private var sessionFiles: [String: (changed: Date, session: Session)] = [:]
 +
 +    private init() {
 +        seen = (try? JSONDecoder().decode([String: Int].self,
@@ -6853,7 +8066,10 @@ index 0000000..3d20550
 +    func start() {
 +        guard timer == nil else { return }
 +        try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
-+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }
++        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
++            self?.refresh()
++            DockWindowClose.reattachIfWindow()
++        }
 +        moveTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refreshMovable() }
 +        refreshMovable()
 +        DockHousekeeping.run()
@@ -6867,6 +8083,13 @@ index 0000000..3d20550
 +        costTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.refreshCosts() }
 +        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.refreshCosts() }
 +        agentTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refreshAgentsRunning() }
++        remoteTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
++            self?.refreshRemoteNames()
++        }
++        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.refreshRemoteNames() }
++        staleTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
++            self?.resumeStaleLogins()
++        }
 +        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil,
 +                                               queue: .main) { [weak self] _ in self?.applySettings() }
 +        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
@@ -6907,6 +8130,7 @@ index 0000000..3d20550
 +            self.saveTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
 +                // One at a time: a slow save must not stack up behind itself.
 +                guard let self, !self.saving else { return }
++                DockLayout.save()
 +                self.saving = true
 +                DispatchQueue.global(qos: .utility).async {
 +                    _ = DockProcess.run("/bin/bash", [restarter, "--save"], timeout: 60, log: DockLog.restart)
@@ -6937,13 +8161,20 @@ index 0000000..3d20550
 +                let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
 +                if f.count == 6, f[0] == "window", let pid = Int32(f[1]) {
 +                    windows.append(Undocked(pid: pid, name: f[4], cwd: f[5], busy: f[2] == "1", moving: f[3] == "1"))
++                } else if f.count == 5, f[0] == "shell", let pid = Int32(f[1]) {
++                    let programs = f[3].split(separator: ",").map(String.init)
++                    windows.append(Undocked(pid: pid, name: "Ghostty", cwd: "", busy: !programs.isEmpty,
++                                            moving: f[4] == "1", shell: true, tabs: Int(f[2]) ?? 0, programs: programs))
 +                } else if f.count == 2, f[0] == "undocking" {
 +                    leaving.insert(f[1])
 +                } else if f.count == 2, f[0] == "restarting" {
 +                    restarts.insert(f[1])
 +                }
 +            }
-+            windows.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
++            windows.sort {
++                $0.shell != $1.shell ? !$0.shell
++                    : $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
++            }
 +            let missing = self?.readMissing() ?? []
 +            DispatchQueue.main.async {
 +                guard let self else { return }
@@ -6970,8 +8201,12 @@ index 0000000..3d20550
 +    /// Moves one session from its own Ghostty app into a tab here at once:
 +    /// claude is stopped and resumed, busy or not.
 +    func dock(_ u: Undocked) {
-+        if let i = undocked.firstIndex(of: u) { undocked[i].moving = true }
-+        runMover(["--now", "--pid", String(u.pid)])
++        whenTabsOpen { [weak self] in
++            guard let self else { return }
++            if let i = self.undocked.firstIndex(of: u) { self.undocked[i].moving = true }
++            // A shell-only Ghostty docks once what its tabs run has finished.
++            self.runMover(u.shell ? ["--shells", String(u.pid)] : ["--now", "--pid", String(u.pid)])
++        }
 +    }
 +
 +    /// Moves a tab's session out into a Ghostty app of its own, at once.
@@ -6980,6 +8215,28 @@ index 0000000..3d20550
 +        undocking.insert(sid)
 +        closeWhenEmpty[row.id] = Date()
 +        runMover(["--now", "--undock", sid])
++    }
++
++    /// Runs `move` if this app will take a new tab. macOS refuses Apple events
++    /// to a running copy of the app whose files were deleted (-1743), and a
++    /// session stopped then would come back in a separate Ghostty, so ask before
++    /// anything is stopped. The mover makes the same check; this is what the
++    /// user gets to see.
++    func whenTabsOpen(_ move: @escaping () -> Void) {
++        DispatchQueue.global(qos: .userInitiated).async {
++            let script = "tell application id \"\(Bundle.main.bundleIdentifier ?? "")\" to count windows"
++            let answer = DockProcess.run("/usr/bin/osascript", ["-e", script], timeout: 10, log: DockLog.sessions)
++            DispatchQueue.main.async {
++                if answer?.status == 0 { move(); return }
++                let alert = NSAlert()
++                alert.messageText = "Ghostty Dock can't open new tabs"
++                alert.informativeText = """
++                    No session was stopped. macOS is refusing this copy of the app, usually because \
++                    it was replaced by an update while running. Restart Ghostty Dock, then try again.
++                    """
++                alert.runModalNearPointer()
++            }
++        }
 +    }
 +
 +    /// Stops a tab's session and resumes it in a new tab, at once; the old
@@ -6991,10 +8248,52 @@ index 0000000..3d20550
 +        runMover(["--now", "--restart", sid])
 +    }
 +
++    /// After a logout or login window crash, the tabs that came back still
++    /// run in the ended login: no network lookups, Keychain, clipboard or
++    /// opening apps. Each such session is resumed here, in this login, once
++    /// it is quiet (the mover waits), with its flags and conversation.
++    private func resumeStaleLogins() {
++        guard let loginAt = DockStaleLogin.loginAt() else { return }
++        let candidates = rows.compactMap { row -> (sid: String, started: Date)? in
++            guard let sid = row.sessionId, let pid = row.pid, !staleResumed.contains(sid),
++                  !restarting.contains(sid), let started = DockStaleLogin.started(pid) else { return nil }
++            return (sid, started)
++        }
++        for sid in DockStaleLogin.stale(candidates, loginAt: loginAt) {
++            guard let row = rows.first(where: { $0.sessionId == sid }) else { continue }
++            DockLog.sessions.notice("\(row.name, privacy: .public) is from an ended login; resuming it")
++            staleResumed.insert(sid)
++            restarting.insert(sid)
++            closeWhenEmpty[row.id] = Date()
++            runMover(["--restart", sid])
++        }
++    }
++
 +    /// Whether a row can be compacted now: only while claude sits at its
 +    /// prompt, as typing into a busy or asking session would queue or answer.
 +    func canCompact(_ row: Row) -> Bool {
 +        row.sessionId != nil && (row.status == .idle || row.status == .unread)
++    }
++
++    /// With the setting on: every running session's Remote Control title is
++    /// set to its repo, on the server, as the phone shows that title and a
++    /// rename or --remote-control from the Mac doesn't change one it already
++    /// has. ghostty-dock-rc-titles does it; it also undoes the phone's own
++    /// retitling, every five minutes.
++    private func refreshRemoteNames() {
++        let titler = FileManager.default.homeDirectoryForCurrentUser
++            .appendingPathComponent(".local/bin/ghostty-dock-rc-titles").path
++        guard DockSettings.remoteEverySession, !remoteLooking,
++              FileManager.default.isExecutableFile(atPath: titler)
++        else { return }
++        remoteLooking = true
++        DispatchQueue.global(qos: .utility).async { [weak self] in
++            if let r = DockProcess.run("/usr/bin/python3", [titler], timeout: 120, log: DockLog.sessions),
++               !r.text.isEmpty {
++                DockLog.sessions.notice("remote titles: \(r.text, privacy: .public)")
++            }
++            DispatchQueue.main.async { self?.remoteLooking = false }
++        }
 +    }
 +
 +    /// Types /compact-async into the session, so Claude Burst summarises it
@@ -7289,13 +8588,16 @@ index 0000000..3d20550
 +
 +    /// The timer Claude Code shows while it works, "✻ Burrowing… (8m 37s ·
 +    /// ↓ 9.4k tokens)", or its hints then: "esc to interrupt", and "ctrl+b
-+    /// to run in background" in place of it while a command runs.
++    /// to run in background" in place of it while a command runs, and
++    /// "Waiting for API response · will retry in 1m 38s" while it waits out
++    /// an API error to try again.
 +    /// Only the screen's last lines, where they are: the same words higher
 +    /// up are old output or a reply quoting them.
 +    static func working(_ screen: String) -> Bool {
 +        let tail = screen.split(separator: "\n").filter { $0.contains { !$0.isWhitespace } }
 +            .suffix(20).joined(separator: "\n")
 +        return tail.contains("esc to interrupt") || tail.contains("to run in background")
++            || tail.contains("Waiting for API response") || tail.contains("will retry in")
 +            || tail.range(of: #"… \(\d+[hms]"#, options: .regularExpression) != nil
 +    }
 +
@@ -7401,17 +8703,29 @@ index 0000000..3d20550
 +        // Sessions with no tab of their own (background sessions in Claude
 +        // Code's daemon), shown by whichever tab's title names them.
 +        var detached: [Session] = []
-+        let files = (try? FileManager.default.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
++        let files = (try? FileManager.default.contentsOfDirectory(
++            at: sessionsDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
++        var read: [String: (changed: Date, session: Session)] = [:]
++        defer { sessionFiles = read }
 +        for url in files where url.pathExtension == "json" {
 +            let file = url.lastPathComponent
-+            guard file.hasPrefix("srf-") || file.hasPrefix("sid-"),
-+                  let data = try? Data(contentsOf: url),
-+                  let s = try? JSONDecoder().decode(Session.self, from: data) else { continue }
++            guard file.hasPrefix("srf-") || file.hasPrefix("sid-") else { continue }
++            let changed = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
++                .contentModificationDate ?? .distantPast
++            let s: Session
++            if let old = sessionFiles[url.path], old.changed == changed, changed != .distantPast {
++                s = old.session
++            } else {
++                guard let data = try? Data(contentsOf: url),
++                      let decoded = try? JSONDecoder().decode(Session.self, from: data) else { continue }
++                s = decoded
++            }
 +            if let pid = s.claude_pid, kill(pid, 0) != 0, errno != EPERM {
 +                // claude went away without a SessionEnd (closed tab, crash).
 +                try? FileManager.default.removeItem(at: url)
 +                continue
 +            }
++            read[url.path] = (changed, s)
 +            if file.hasPrefix("srf-") {
 +                sessions[String(url.deletingPathExtension().lastPathComponent.dropFirst(4))] = s
 +            } else {
@@ -7427,12 +8741,22 @@ index 0000000..3d20550
 +        var busyNow: [String: Int] = [:]
 +        var doneNow: Set<String> = []
 +        defer { busy = busyNow; done = doneNow }
++        // With the app in the background no window is key or main, which
++        // left no row selected: the frontmost terminal window stands in.
++        let anyMain = TerminalController.all.contains { $0.window?.isKeyWindow == true || $0.window?.isMainWindow == true }
++        let front = anyMain ? nil : NSApp.orderedWindows.first { $0.isVisible && $0.windowController is TerminalController }
++        refreshHoldNames()
 +        for controller in TerminalController.all {
 +            guard let window = controller.window else { continue }
 +            let id = ObjectIdentifier(controller)
 +            if !order.contains(id) { order.append(id) }
++            if children[id] == nil,
++               let parent = controller.surfaceTree.lazy
++                   .compactMap({ self.holdNames[$0.id.uuidString].flatMap { self.savedChildren[$0] } }).first {
++                children[id] = parent
++            }
 +            let isSelectedTab = window.tabGroup?.selectedWindow.map { $0 === window } ?? true
-+            let selected = isSelectedTab && (window.isKeyWindow || window.isMainWindow)
++            let selected = isSelectedTab && (window.isKeyWindow || window.isMainWindow || window === front)
 +            let onScreen = appActive && selected
 +
 +            func status(of s: Session, seenKey key: String) -> Status {
@@ -7493,7 +8817,7 @@ index 0000000..3d20550
 +            let pwd = focused?.pwd ?? (failed ? focused?.startConfig?.workingDirectory : nil) ?? ""
 +            let name = best?.name.isEmpty == false ? best!.name
 +                : !title.isEmpty ? title
-+                : (pwd as NSString).lastPathComponent
++                : Self.folderName(pwd)
 +            let key = best?.sid ?? "dir:" + pwd
 +            if let old = tabKeys[id], old.controller === controller, old.key != key,
 +               !liveSids.contains(old.key), !built.contains(where: { $0.key == key }) {
@@ -7531,6 +8855,7 @@ index 0000000..3d20550
 +                             failed: failed,
 +                             pid: best?.pid,
 +                             parent: children[id],
++                             scripts: (status == .idle || status == .unread) ? best?.pid.map(DockScripts.count) ?? 0 : 0,
 +                             controller: controller))
 +        }
 +        order.removeAll { id in !built.contains { $0.id == id } }
@@ -7572,6 +8897,8 @@ index 0000000..3d20550
 +                                           tag: \.tag)
 +        for i in grouped.indices { if let name = groupNames[grouped[i].id] { grouped[i].title = name } }
 +        children = children.filter { id, _ in built.contains { $0.id == id } }
++        saveChildren(built)
++        restoreOrSaveSelection(built)
 +        grouped = Self.underParents(grouped)
 +        let flat = grouped.flatMap(\.items)
 +        noticeClosed(flat)
@@ -7699,6 +9026,108 @@ index 0000000..3d20550
 +        return root.isEmpty ? nil : root
 +    }
 +
++    private static let childrenFile = FileManager.default.homeDirectoryForCurrentUser
++        .appendingPathComponent(".local/state/ghostty-dock/children.json")
++    private static let holdDir = FileManager.default.homeDirectoryForCurrentUser
++        .appendingPathComponent(".local/state/ghostty-dock/hold")
++
++    private static func loadChildren() -> [String: String] {
++        (try? Data(contentsOf: childrenFile))
++            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] } ?? [:]
++    }
++
++    /// Surface id to holder name, from hold/<name>.surface, which a holder
++    /// rewrites when a tab attaches to it. Read again when the folder changes.
++    private func refreshHoldNames() {
++        let changed = (try? FileManager.default.attributesOfItem(atPath: Self.holdDir.path))?[.modificationDate] as? Date
++        guard changed != holdNamesAt || changed == nil else { return }
++        holdNamesAt = changed
++        let files = (try? FileManager.default.contentsOfDirectory(at: Self.holdDir, includingPropertiesForKeys: nil)) ?? []
++        var names: [String: String] = [:]
++        for f in files where f.pathExtension == "surface" {
++            guard let text = try? String(contentsOf: f, encoding: .utf8) else { continue }
++            let surface = text.trimmingCharacters(in: .whitespacesAndNewlines)
++            if !surface.isEmpty { names[surface] = f.deletingPathExtension().lastPathComponent }
++        }
++        holdNames = names
++    }
++
++    private static let selectionFile = FileManager.default.homeDirectoryForCurrentUser
++        .appendingPathComponent(".local/state/ghostty-dock/selected.json")
++
++    private static func loadSelection() -> [String: Any]? {
++        (try? Data(contentsOf: selectionFile)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
++    }
++
++    private func holders(_ row: Row) -> [String] {
++        (row.controller.map { Array($0.surfaceTree) } ?? []).compactMap { holdNames[$0.id.uuidString] }
++    }
++
++    /// After a start: once no new tab has opened for three seconds, selects
++    /// the tab that was selected before (by holder, else session), without
++    /// bringing the app forward. After that, records the selection.
++    private func restoreOrSaveSelection(_ rows: [Row]) {
++        if rows.count != tabCount { tabCount = rows.count; tabCountSince = Date() }
++        if let want = selectionToRestore {
++            let waited = Date().timeIntervalSince(launchedAt)
++            guard waited < 180 else { selectionToRestore = nil; return }
++            guard Date().timeIntervalSince(tabCountSince) >= 3, !rows.isEmpty else { return }
++            let names = Set(want["holders"] as? [String] ?? [])
++            let sid = want["session"] as? String
++            let match = rows.first { !names.isDisjoint(with: holders($0)) }
++                ?? rows.first { sid != nil && $0.sessionId == sid }
++            if let match {
++                selectionToRestore = nil
++                if !match.selected, let controller = match.controller, let window = controller.window {
++                    DockLog.sessions.notice("selecting \(match.name, privacy: .public) again, as before the restart")
++                    window.makeKeyAndOrderFront(nil)
++                    if let surface = controller.focusedSurface ?? controller.surfaceTree.first {
++                        window.makeFirstResponder(surface)
++                    }
++                    DispatchQueue.main.async { [weak self] in self?.refresh() }
++                }
++            } else if waited > 60 {
++                selectionToRestore = nil
++            }
++            return
++        }
++        guard let row = rows.first(where: \.selected) else { return }
++        var info: [String: Any] = ["holders": holders(row)]
++        if let sid = row.sessionId { info["session"] = sid }
++        guard let data = try? JSONSerialization.data(withJSONObject: info, options: [.sortedKeys]),
++              let text = String(data: data, encoding: .utf8), text != savedSelection else { return }
++        savedSelection = text
++        _ = DockLog.write(data, to: Self.selectionFile)
++    }
++
++    /// Writes the children by holder name when that has changed. Held
++    /// children whose tab is still opening keep their entry.
++    private func saveChildren(_ rows: [Row]) {
++        var saved: [String: String] = [:]
++        var seen: Set<String> = []
++        for row in rows {
++            for surface in row.controller.map({ Array($0.surfaceTree) }) ?? [] {
++                guard let name = holdNames[surface.id.uuidString] else { continue }
++                seen.insert(name)
++                if let parent = children[row.id] { saved[name] = parent }
++            }
++        }
++        // A holder still running but not yet back in a tab keeps its parent.
++        let live = Set(holdNames.values)
++        for (name, parent) in savedChildren where live.contains(name) && !seen.contains(name) {
++            saved[name] = parent
++        }
++        guard saved != savedChildren else { return }
++        savedChildren = saved
++        writeChildren()
++    }
++
++    private func writeChildren() {
++        if let data = try? JSONSerialization.data(withJSONObject: savedChildren, options: [.sortedKeys]) {
++            _ = DockLog.write(data, to: Self.childrenFile)
++        }
++    }
++
 +    /// Moves each child terminal to just under its parent, whatever the sort
 +    /// or grouping put it; one whose parent has gone stays where it is.
 +    static func underParents(_ groups: [DockOrdering.Group<Row>]) -> [DockOrdering.Group<Row>] {
@@ -7730,6 +9159,19 @@ index 0000000..3d20550
 +        guard let child = TerminalController.newTab(ghostty, from: window, withBaseConfig: config) else { return }
 +        // A child of a child goes under the same parent.
 +        children[ObjectIdentifier(child)] = row.parent ?? row.key
++        refresh()
++    }
++
++    /// A child terminal becomes a row like any other: out from under its
++    /// parent, and so after a restart too. Its saved entry goes first, or
++    /// the next refresh would put it back.
++    func standAlone(_ row: Row) {
++        guard children[row.id] != nil else { return }
++        let names = row.controller.map { Array($0.surfaceTree) }?.compactMap { holdNames[$0.id.uuidString] } ?? []
++        children[row.id] = nil
++        for name in names { savedChildren[name] = nil }
++        writeChildren()
++        DockLog.sessions.notice("\(row.name, privacy: .public) stands on its own")
 +        refresh()
 +    }
 +
@@ -7766,7 +9208,7 @@ index 0000000..3d20550
 +        guard !name.isEmpty else { NSSound.beep(); return }
 +        let opener = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/ghostty-dock-open").path
 +        guard FileManager.default.isExecutableFile(atPath: opener) else { NSSound.beep(); return }
-+        DockProcess.launch("/bin/bash", [opener, "--command", "caffeinate -i claude --worktree \(name)", root],
++        DockProcess.launch("/bin/bash", [opener, "--command", "caffeinate -i claude \(DockBypass.flags("--worktree \(name)"))", root],
 +                           log: DockLog.sessions)
 +    }
 +
@@ -7885,7 +9327,7 @@ index 0000000..3d20550
 +        DockLog.sessions.notice("reopen \(c.name, privacy: .public) (\(c.sessionId, privacy: .public))")
 +        DockHistory.shared.remove(c.sessionId)
 +        return DockProcess.launch("/bin/bash", [opener, "--command",
-+                                                "caffeinate -i claude --resume \(c.sessionId) \(c.flags)", c.folder],
++                                                "caffeinate -i claude --resume \(c.sessionId) \(DockBypass.flags(c.flags))", c.folder],
 +                                  log: DockLog.sessions)
 +    }
 +
@@ -7902,7 +9344,7 @@ index 0000000..3d20550
 +            let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
 +            // A folder, not an id shifted into its place by an old restart.
 +            guard f.count >= 2, !f[1].isEmpty, f[0].hasPrefix("/") else { return nil }
-+            return Closed(sessionId: f[1], name: (f[0] as NSString).lastPathComponent, folder: f[0],
++            return Closed(sessionId: f[1], name: Self.folderName(f[0]), folder: f[0],
 +                          flags: f.count > 2 ? f[2] : "")
 +        }
 +    }
@@ -8153,13 +9595,21 @@ index 0000000..3d20550
 +        src.resume()
 +        watcher = src
 +    }
++
++    /// A folder's name for a row; the home folder's is the login name, so
++    /// it is called Home.
++    static func folderName(_ path: String) -> String {
++        let home = FileManager.default.homeDirectoryForCurrentUser.path
++        let p = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
++        return p == home || p == "~" ? "Home" : (p as NSString).lastPathComponent
++    }
 +}
 diff --git a/macos/Sources/Features/Dock/DockSettings.swift b/macos/Sources/Features/Dock/DockSettings.swift
 new file mode 100644
-index 0000000..481cc5e
+index 0000000..b76d036
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSettings.swift
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,463 @@
 +import AppKit
 +import ServiceManagement
 +import SwiftUI
@@ -8174,6 +9624,7 @@ index 0000000..481cc5e
 +    static let dockBadgeKey = "dock.dockBadge"
 +    static let sidebarWidthKey = "dock.sidebarWidth"
 +    static let restoreSessionsKey = "dock.restoreSessions"
++    static let remoteEverySessionKey = "dock.remoteEverySession"
 +    static let holdSessionsKey = "dock.holdSessions"
 +    static let themeKey = "dock.theme"
 +    static let groupingKey = "dock.grouping"
@@ -8246,6 +9697,7 @@ index 0000000..481cc5e
 +    static var jumpHotKey: Bool { UserDefaults.standard.bool(forKey: jumpHotKeyKey) }
 +    static var dockBadge: Bool { UserDefaults.standard.bool(forKey: dockBadgeKey) }
 +    static var restoreSessions: Bool { UserDefaults.standard.bool(forKey: restoreSessionsKey) }
++    static var remoteEverySession: Bool { UserDefaults.standard.bool(forKey: remoteEverySessionKey) }
 +    static var holdSessions: Bool { UserDefaults.standard.bool(forKey: holdSessionsKey) }
 +    static var bellKeep: Int { max(10, UserDefaults.standard.integer(forKey: bellKeepKey)) }
 +    static var bellWaiting: Bool { UserDefaults.standard.bool(forKey: bellWaitingKey) }
@@ -8261,6 +9713,8 @@ index 0000000..481cc5e
 +    @AppStorage(DockSettings.jumpHotKeyKey) private var jumpHotKey = true
 +    @AppStorage(DockSettings.dockBadgeKey) private var dockBadge = true
 +    @AppStorage(DockSettings.restoreSessionsKey) private var restoreSessions = true
++    @AppStorage(DockSettings.remoteEverySessionKey) private var remoteEverySession = false
++    @State private var skipPermissions = DockBypass.enabled
 +    @AppStorage(DockSettings.holdSessionsKey) private var holdSessions = true
 +    @AppStorage(DockSettings.themeKey) private var theme = ""
 +    @AppStorage(DockSettings.groupingKey) private var grouping = DockSettings.Grouping.none
@@ -8366,8 +9820,11 @@ index 0000000..481cc5e
 +            Section {
 +                Picker("Theme", selection: $theme) {
 +                    Text("As in the Ghostty config (\(DockTheme.configTheme ?? "Ghostty's default"))").tag("")
-+                    Divider()
-+                    ForEach(DockTheme.choices, id: \.self) { Text($0).tag($0) }
++                    ForEach(DockTheme.groups, id: \.title) { group in
++                        Section(group.title) {
++                            ForEach(group.names, id: \.self) { Text($0).tag($0) }
++                        }
++                    }
 +                }
 +                .onChange(of: theme) { _ in DockTheme.apply() }
 +                DockThemeSwatch(name: theme.isEmpty ? (DockTheme.configTheme ?? "Catppuccin Mocha") : theme)
@@ -8472,6 +9929,14 @@ index 0000000..481cc5e
 +                    .font(.callout)
 +                Toggle("Keep tabs running when Ghostty Dock quits", isOn: $holdSessions)
 +                Text("Each tab runs in a small holder outside the app, so a quit, crash or restart does not stop it. Shells, dev servers and Claude sessions carry on, and come back as tabs with their scrollback. Applies to tabs opened after you change it.")
++                    .font(.callout)
++                Toggle("Start every session with permissions skipped", isOn: Binding(
++                    get: { skipPermissions }, set: { skipPermissions = $0; DockBypass.set($0) }))
++                    .onAppear { skipPermissions = DockBypass.enabled }
++                Text("New, restarted, moved and reopened sessions start with --dangerously-skip-permissions, unless they were given a --permission-mode. A running session changes when it is next restarted. Saved in ~/.config/claude-panel/options, which your launcher reads too.")
++                    .font(.callout)
++                Toggle("Name every Remote Control session after its repo", isOn: $remoteEverySession)
++                Text("Every five minutes, each running session's title on the phone is set to its repo, using your Claude login, so the phone's own titles are undone. Sessions are not restarted. The grey line under the title is the phone's and can't be changed.")
 +                    .font(.callout)
 +                Toggle("Open Ghostty Dock at login", isOn: $startAtLogin)
 +                    .onChange(of: startAtLogin) { on in setLogin(on) }
@@ -8610,10 +10075,10 @@ index 0000000..481cc5e
 +}
 diff --git a/macos/Sources/Features/Dock/DockShortcuts.swift b/macos/Sources/Features/Dock/DockShortcuts.swift
 new file mode 100644
-index 0000000..aa4116b
+index 0000000..ea8091f
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockShortcuts.swift
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,127 @@
 +import AppKit
 +import Carbon
 +
@@ -8674,13 +10139,20 @@ index 0000000..aa4116b
 +            Shortcut(keys: "⌘⇧J", title: "Next Session That Needs You", keyCode: kVK_ANSI_J,
 +                     modifiers: [.command, .shift]) { model.jumpToNextWaiting() },
 +            Shortcut(keys: "⌘⇧R", title: "Restart Session", keyCode: kVK_ANSI_R,
-+                     modifiers: [.command, .shift]) { current.map(model.restart) ?? NSSound.beep() },
++                     modifiers: [.command, .shift]) {
++                guard let row = current else { NSSound.beep(); return }
++                model.whenTabsOpen { model.restart(row) }
++            },
 +            Shortcut(keys: "⌘⇧U", title: "Undock Session", keyCode: kVK_ANSI_U,
 +                     modifiers: [.command, .shift]) { current.map(model.undock) ?? NSSound.beep() },
 +            Shortcut(keys: "⌘⇧S", title: "Show or Hide the Sidebar", keyCode: kVK_ANSI_S,
 +                     modifiers: [.command, .shift]) {
 +                UserDefaults.standard.set(!DockSettings.showSidebar, forKey: DockSettings.showSidebarKey)
 +            },
++            Shortcut(keys: "⌘⇧B", title: "Show or Hide the Browser", keyCode: kVK_ANSI_B,
++                     modifiers: [.command, .shift]) { MainActor.assumeIsolated { DockBrowser.toggle() } },
++            Shortcut(keys: "⌘⇧E", title: "Show or Hide the File Viewer", keyCode: kVK_ANSI_E,
++                     modifiers: [.command, .shift]) { MainActor.assumeIsolated { DockViewer.toggle() } },
 +        ]
 +        return list
 +    }()
@@ -8698,6 +10170,8 @@ index 0000000..aa4116b
 +        ("Restart session", "⌘⇧R"),
 +        ("Undock session", "⌘⇧U"),
 +        ("Show or hide the sidebar", "⌘⇧S"),
++        ("Show or hide the browser", "⌘⇧B"),
++        ("Show or hide the file viewer (⌘-click a file name to open one)", "⌘⇧E"),
 +    ]
 +
 +    /// The selected row, when it holds a Claude Code session.
@@ -8734,10 +10208,10 @@ index 0000000..aa4116b
 +}
 diff --git a/macos/Sources/Features/Dock/DockSidebarView.swift b/macos/Sources/Features/Dock/DockSidebarView.swift
 new file mode 100644
-index 0000000..e7e8690
+index 0000000..fc90caf
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSidebarView.swift
-@@ -0,0 +1,1423 @@
+@@ -0,0 +1,1688 @@
 +import AppKit
 +import SwiftUI
 +import UniformTypeIdentifiers
@@ -8760,6 +10234,10 @@ index 0000000..e7e8690
 +    /// Only for sessions outside the Dock, so they read as not part of it.
 +    static var grey: Color { theme.grey }
 +    static var greyLine: Color { theme.greyLine }
++    /// An electric green that reads on every theme, for a count that wants attention.
++    static let alert = Color(red: 0.0, green: 0.9, blue: 0.4)
++    /// What goes on top of it: white is too faint on so bright a green.
++    static let alertInk = Color(red: 0.0, green: 0.16, blue: 0.07)
 +    static var scheme: ColorScheme { theme.dark ? .dark : .light }
 +
 +    static func color(_ s: DockSessions.Status) -> Color {
@@ -8832,7 +10310,11 @@ index 0000000..e7e8690
 +                            }
 +                        }
 +                        if !model.folded(group) {
-+                            ForEach(model.shown(group.items)) { row in rowView(row) }
++                            let shown = model.shown(group.items)
++                            ForEach(Array(shown.enumerated()), id: \.element.id) { i, row in
++                                rowView(row, moreBelow: row.parent != nil && i + 1 < shown.count
++                                            && shown[i + 1].parent == row.parent)
++                            }
 +                        }
 +                    }
 +                    // Drop here to move a row to the end.
@@ -8890,7 +10372,7 @@ index 0000000..e7e8690
 +              + "Reopen resumes each in a tab. Log: ~/.local/state/ghostty-dock/restart-dock.log")
 +    }
 +
-+    private func rowView(_ row: DockSessions.Row) -> some View {
++    private func rowView(_ row: DockSessions.Row, moreBelow: Bool = false) -> some View {
 +        DockRowView(row: row,
 +                    cost: showCost ? row.sessionId.flatMap { model.costs[$0] } : nil,
 +                    undocking: row.sessionId.map(model.undocking.contains) ?? false,
@@ -8902,9 +10384,20 @@ index 0000000..e7e8690
 +                    onCompact: { model.compact(row) },
 +                    onClose: { model.closeTab(row) },
 +                    onUndock: { model.undock(row) },
-+                    onRestart: { model.restart(row) })
++                    onRestart: { model.whenTabsOpen { model.restart(row) } })
 +            // A child terminal is indented under its session.
-+            .padding(.leading, row.parent != nil ? 20 : 0)
++            // A running session steps in from the left, so what's running
++            // stands out down the list; the selected one steps in further.
++            .padding(.leading, indent(row))
++            // A dotted elbow from the session above to each of its terminals,
++            // starting under the session wherever it has stepped in to.
++            .background(alignment: .leading) {
++                if row.parent != nil {
++                    DockChildLine(start: parentIndent(row), width: indent(row), moreBelow: moreBelow)
++                }
++            }
++            .animation(.easeInOut(duration: 0.25), value: row.status == .running || row.scripting)
++            .animation(.easeInOut(duration: 0.2), value: row.selected)
 +            .onTapGesture { model.select(row) }
 +            // Raised: a little larger and lifted, drawn above its neighbours.
 +            .scaleEffect(row.selected ? 1.025 : 1)
@@ -8915,6 +10408,23 @@ index 0000000..e7e8690
 +            .onDrop(of: [.text], delegate: DockRowDrop(target: row.key, hovered: $dropTarget))
 +            .overlay(alignment: .top) { dropLine(dropTarget == row.key).offset(y: -2) }
 +    }
++
++    /// A child terminal sits a little in under its session; a running
++    /// row (or one waiting on a script it started) steps in from the left
++    /// and the selected one further.
++    /// A child moves with its session: when the session steps in, so does it.
++    static func indent(_ row: DockSessions.Row) -> CGFloat {
++        let busy = row.status == .running || row.scripting
++        return row.parent != nil ? 14 + (row.selected ? 10 : busy ? 6 : 0)
++            : row.selected ? 30 : busy ? 16 : 0
++    }
++
++    private func parentIndent(_ row: DockSessions.Row) -> CGFloat {
++        guard let key = row.parent, let parent = model.visibleRows.first(where: { $0.key == key }) else { return 0 }
++        return Self.indent(parent)
++    }
++
++    private func indent(_ row: DockSessions.Row) -> CGFloat { parentIndent(row) + Self.indent(row) }
 +
 +    /// Where a dragged row will land.
 +    private func dropLine(_ shown: Bool) -> some View {
@@ -8959,6 +10469,23 @@ index 0000000..e7e8690
 +                        .controlSize(.small)
 +                        .help("Stop the restart; the sessions carry on as they are")
 +                }
++            }
++            // A new install whose Claude Code isn't logged in (or isn't
++            // there): sessions can't start, so this comes first.
++            if let access = login.access, access != .ready {
++                VStack(alignment: .leading, spacing: 5) {
++                    Label(access == .missing ? "Claude Code isn't installed" : "Claude Code isn't logged in",
++                          systemImage: "person.crop.circle.badge.exclamationmark")
++                        .font(.system(size: 11, weight: .bold))
++                        .foregroundStyle(DockPalette.peach)
++                        .fixedSize(horizontal: false, vertical: true)
++                    Button(access == .missing ? "Install and Log In…" : "Log In…") { login.logIn() }
++                        .buttonStyle(.bordered)
++                        .controlSize(.small)
++                }
++                .help(access == .missing
++                      ? "No claude on your PATH. This opens a tab that installs Claude Code, then logs you in."
++                      : "claude auth status says you're not logged in. This opens a tab that runs claude auth login; your browser opens to sign in.")
 +            }
 +            // Sessions still on the login you left: Remote Control is gone
 +            // from them until they are resumed.
@@ -9051,7 +10578,7 @@ index 0000000..e7e8690
 +            }
 +        }
 +        .padding(.horizontal, 6)
-+        .padding(.vertical, 2.5)
++        .padding(.vertical, 4)
 +        .background(Capsule().fill(DockPalette.base))
 +        .overlay(Capsule().strokeBorder(searching ? DockPalette.blue : DockPalette.grey.opacity(0.35),
 +                                        lineWidth: searching ? 1.5 : 1))
@@ -9072,8 +10599,9 @@ index 0000000..e7e8690
 +                let n = model.rows.filter { $0.status == status }.count
 +                let on = model.statusFilter == status
 +                Button { withAnimation(.easeOut(duration: 0.15)) { model.toggleFilter(status) } } label: {
-+                    DockCounter(symbol: DockStatusDot.symbol(status), count: n, color: DockPalette.color(status),
-+                                selected: on, dimmed: model.statusFilter != nil && !on)
++                    DockCounter(symbol: DockStatusDot.symbol(status), count: n,
++                                color: status == .running ? DockPalette.alert : DockPalette.color(status),
++                                selected: on, dimmed: model.statusFilter != nil && !on, loud: status == .running)
 +                }
 +                .buttonStyle(.plain)
 +                .help(on ? "Showing only \(DockPalette.label(status).lowercased()); click to show all"
@@ -9081,7 +10609,8 @@ index 0000000..e7e8690
 +            }
 +            if !model.undocked.isEmpty {
 +                DockCounter(symbol: "macwindow", count: model.undocked.count, color: DockPalette.grey)
-+                    .help("\(model.undocked.count) undocked")
++                    .fixedSize()
++                    .help("\(model.undocked.count) outside the dock: Ghostty windows of their own, listed under Undocked")
 +            }
 +            Spacer(minLength: 0)
 +        }
@@ -9089,8 +10618,27 @@ index 0000000..e7e8690
 +
 +    private var headerButtons: some View {
 +        HStack(spacing: 2) {
-+            Text("Sessions").font(.system(size: 12, weight: .semibold)).foregroundStyle(DockPalette.text)
++            Text("\(model.rows.count) Session\(model.rows.count == 1 ? "" : "s")")
++                .font(.system(size: 12, weight: .semibold)).foregroundStyle(DockPalette.text)
 +                .lineLimit(1).fixedSize()
++                .padding(.trailing, 4)
++            DockHeaderButton(symbol: "calendar", size: 11, color: DockPalette.teal,
++                             tip: "Daily Recap: today's spend, work, files and commits (⌘⇧Y)",
++                             shownTip: $headerTip, tipColor: $headerTipColor) {
++                DockRecapWindow.shared.show(near: NSEvent.mouseLocation)
++            }
++            DockHeaderButton(symbol: "paintpalette.fill", color: selectedTag.map(DockPalette.color) ?? DockPalette.color(DockTag.pink),
++                             tip: "Colour this session, its row and its terminal", shownTip: $headerTip,
++                             tipColor: $headerTipColor) {
++                showColours.toggle()
++            }
++            .popover(isPresented: $showColours, arrowEdge: .bottom) {
++                if let row = model.rows.first(where: \.selected) {
++                    DockColourPicker(row: row) { showColours = false }
++                } else {
++                    Text("Click a session first").padding(14)
++                }
++            }
 +            Spacer(minLength: 4)
 +            // Always there; green and filled when a newer build is installed.
 +            if updates.state != .installing {
@@ -9153,11 +10701,6 @@ index 0000000..e7e8690
 +                             shownTip: $headerTip, tipColor: $headerTipColor) {
 +                DockAgentsWindow.shared.show(near: NSEvent.mouseLocation)
 +            }
-+            DockHeaderButton(symbol: "calendar", size: 11, color: DockPalette.teal,
-+                             tip: "Daily Recap: today's spend, work, files and commits (⌘⇧Y)",
-+                             shownTip: $headerTip, tipColor: $headerTipColor) {
-+                DockRecapWindow.shared.show(near: NSEvent.mouseLocation)
-+            }
 +            if showBell {
 +            DockHeaderButton(symbol: notices.unread > 0 ? "bell.badge.fill" : "bell",
 +                             color: DockPalette.color(DockTag.orange),
@@ -9171,18 +10714,6 @@ index 0000000..e7e8690
 +            }
 +            DockHeaderButton(symbol: "apple.terminal", size: 11, color: DockPalette.green, tip: "New tab (⌘T)",
 +                             shownTip: $headerTip, tipColor: $headerTipColor, action: onNewTab)
-+            DockHeaderButton(symbol: "paintpalette.fill", color: selectedTag.map(DockPalette.color) ?? DockPalette.color(DockTag.pink),
-+                             tip: "Colour this session, its row and its terminal", shownTip: $headerTip,
-+                             tipColor: $headerTipColor) {
-+                showColours.toggle()
-+            }
-+            .popover(isPresented: $showColours, arrowEdge: .bottom) {
-+                if let row = model.rows.first(where: \.selected) {
-+                    DockColourPicker(row: row) { showColours = false }
-+                } else {
-+                    Text("Click a session first").padding(14)
-+                }
-+            }
 +            // About is Settings' last tab; with an update out the gear turns
 +            // green, flashes and opens there.
 +            DockHeaderButton(symbol: "gearshape.fill",
@@ -9202,7 +10733,7 @@ index 0000000..e7e8690
 +    }
 +}
 +
-+/// 30 colours for a session, by hue, and None. The row and its terminal take it.
++/// 21 colours for a session, by hue, and None. The row and its terminal take it.
 +struct DockColourPicker: View {
 +    var row: DockSessions.Row
 +    var done: () -> Void
@@ -9215,7 +10746,9 @@ index 0000000..e7e8690
 +            Text("Colour for \(row.name)").font(.system(size: 12, weight: .semibold))
 +                .foregroundStyle(DockPalette.text).lineLimit(1)
 +            LazyVGrid(columns: Array(repeating: GridItem(.fixed(26), spacing: 8), count: 7), spacing: 8) {
-+                ForEach(DockTag.offered + (row.tag.map { DockTag.offered.contains($0) ? [] : [$0] } ?? []), id: \.self) { tag in
++                // Only the offered colours, three full rows: a row's colour no
++                // longer offered shows beside its name below, not on a row of its own.
++                ForEach(DockTag.offered, id: \.self) { tag in
 +                    Button {
 +                        DockSessions.shared.setTag(row, tag)
 +                        done()
@@ -9254,7 +10787,10 @@ index 0000000..e7e8690
 +            }
 +            .disabled(row.tag == nil)
 +            .opacity(row.tag == nil ? 0.4 : 1)
-+            HStack {
++            HStack(spacing: 6) {
++                if let tag = row.tag, !DockTag.offered.contains(tag), hover == nil, !hoveringHatch {
++                    Circle().fill(DockPalette.color(tag)).frame(width: 12, height: 12)
++                }
 +                Text(hoveringHatch ? (hoverHatch?.label ?? "Plain") : hover?.label ?? row.tag?.label ?? "No colour")
 +                    .font(.system(size: 11)).foregroundStyle(DockPalette.grey)
 +                Spacer()
@@ -9359,17 +10895,46 @@ index 0000000..e7e8690
 +    var selected = false
 +    /// Another counter is the filter.
 +    var dimmed = false
++    /// Solid, dark on bright, while above 0, to catch the eye.
++    var loud = false
++
++    private var solid: Bool { loud && count > 0 }
++
++    /// The icon turning clockwise, in the ink colour, in Core Animation so it costs
++    /// the app nothing while it spins.
++    static func spinner(_ symbol: String) -> some View {
++        DockLayerAnimation(key: "spin-\(symbol)") { root, b, scale in
++            let config = NSImage.SymbolConfiguration(pointSize: 9.5, weight: .bold)
++                .applying(.init(paletteColors: [NSColor(DockPalette.alertInk)]))
++            guard let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
++                .withSymbolConfiguration(config) else { return }
++            let l = CALayer()
++            l.bounds = CGRect(origin: .zero, size: img.size)
++            l.position = CGPoint(x: b.midX, y: b.midY)
++            l.contents = img.layerContents(forContentsScale: scale)
++            l.contentsScale = scale
++            l.contentsGravity = .resizeAspect
++            l.add(DockLayerAnimation.repeating("transform.rotation.z", from: 0, to: -2 * Double.pi, seconds: 1.6),
++                  forKey: "spin")
++            root.addSublayer(l)
++        }
++    }
 +
 +    var body: some View {
 +        HStack(spacing: 2.5) {
-+            Image(systemName: symbol).font(.system(size: 9.5, weight: .bold))
++            if solid {
++                Self.spinner(symbol).frame(width: 12, height: 12)
++            } else {
++                Image(systemName: symbol).font(.system(size: 9.5, weight: .bold))
++            }
 +            Text("\(count)").font(.system(size: 10.5, weight: .bold)).monospacedDigit()
++                .fixedSize()
 +        }
-+        .foregroundStyle(color)
++        .foregroundStyle(solid ? DockPalette.alertInk : color)
 +        .padding(.horizontal, 5)
 +        .padding(.vertical, 2)
-+        .background(Capsule().fill(color.opacity(selected ? 0.32 : 0.16)))
-+        .overlay(Capsule().strokeBorder(color, lineWidth: selected ? 1.5 : 0))
++        .background(Capsule().fill(solid ? color : color.opacity(selected ? 0.32 : 0.16)))
++        .overlay(Capsule().strokeBorder(solid ? DockPalette.alertInk : color, lineWidth: selected ? 1.5 : 0))
 +        .opacity(selected ? 1 : dimmed ? 0.35 : count == 0 ? 0.4 : 1)
 +    }
 +}
@@ -9413,7 +10978,15 @@ index 0000000..e7e8690
 +
 +    var body: some View {
 +        HStack(spacing: 9) {
-+            DockStatusDot(status: row.status).id(row.status)
++            if row.scripting {
++                Image(systemName: "hourglass")
++                    .font(.system(size: 13, weight: .semibold))
++                    .foregroundStyle(DockPalette.teal)
++                    .frame(width: 18, height: 18)
++                    .dockTip("Its turn is over, but it is waiting on a script it started")
++            } else {
++                DockStatusDot(status: row.status).id(row.status)
++            }
 +            VStack(alignment: .leading, spacing: 1) {
 +                HStack(spacing: 4) {
 +                    if row.parent != nil {
@@ -9433,7 +11006,8 @@ index 0000000..e7e8690
 +                TimelineView(.periodic(from: .now, by: 30)) { ctx in
 +                    Text(row.failed ? "Didn't start · see the tab" : subtitle(now: ctx.date))
 +                        .font(.system(size: 10.5))
-+                        .foregroundStyle(row.failed ? DockPalette.color(DockTag.red) : DockPalette.color(row.status))
++                        .foregroundStyle(row.failed ? DockPalette.color(DockTag.red)
++                                         : row.scripting ? DockPalette.teal : DockPalette.color(row.status))
 +                        .lineLimit(1)
 +                }
 +                if let line = workspace?.summary {
@@ -9576,29 +11150,34 @@ index 0000000..e7e8690
 +            .compactMap { $0 }.joined(separator: "\n"))
 +        .contextMenu {
 +            let model = DockSessions.shared
-+            Button("Rename…") { model.rename(row) }
-+            Button(row.pinned ? "Unpin" : "Pin to the Top") { model.togglePinned(row) }
++            Button { model.rename(row) } label: { Self.item("Rename…", "pencil", .systemOrange) }
++            Button { model.togglePinned(row) } label: { Self.item(row.pinned ? "Unpin" : "Pin to the Top", row.pinned ? "pin.slash" : "pin", .systemRed) }
 +            if row.status == .unread {
-+                Button("Mark as Read") { model.markRead(row) }
++                Button { model.markRead(row) } label: { Self.item("Mark as Read", "envelope.open", .systemBlue) }
 +            } else if row.sessionId != nil && (row.status == .idle) {
-+                Button("Mark as Unread") { model.markUnread(row) }
++                Button { model.markUnread(row) } label: { Self.item("Mark as Unread", "envelope.badge", .systemBlue) }
 +            }
 +            if let url = workspace?.pr?.url.flatMap(URL.init(string:)) {
-+                Button("Open Pull Request #\(workspace!.pr!.number)") { NSWorkspace.shared.open(url) }
++                Button { NSWorkspace.shared.open(url) } label: { Self.item("Open Pull Request #\(workspace!.pr!.number)", "arrow.triangle.pull", .systemPurple) }
 +            }
 +            ForEach(workspace?.ports.prefix(3).map { $0 } ?? [], id: \.self) { port in
-+                Button("Open localhost:\(port)") {
++                Button {
 +                    NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
-+                }
++                } label: { Self.item("Open localhost:\(port)", "globe", .systemTeal) }
 +            }
-+            Button("View Diff") { viewDiff() }.disabled(folder.isEmpty)
-+            Button("New Session in a Worktree…") { model.newWorktreeSession(row) }.disabled(folder.isEmpty)
-+            Button("Child Terminal Here…") { model.childTerminal(row) }
-+            Button("Move Up") { model.move(row, by: -1) }
++            Button { viewDiff() } label: { Self.item("View Diff", "plusminus", .systemGreen) }.disabled(folder.isEmpty)
++            Button { DockPromptsWindow.shared.show(sessionId: row.sessionId, name: row.name) } label: { Self.item("View Prompts", "text.bubble", .systemBlue) }
++                .disabled(row.sessionId == nil)
++            Button { model.newWorktreeSession(row) } label: { Self.item("New Session in a Worktree…", "arrow.triangle.branch", .systemPurple) }.disabled(folder.isEmpty)
++            Button { model.childTerminal(row) } label: { Self.item("Child Terminal Here…", "terminal", .systemTeal) }
++            if row.parent != nil {
++                Button { model.standAlone(row) } label: { Self.item("Stand on Its Own", "arrow.up.left", .systemTeal) }
++            }
++            Button { model.move(row, by: -1) } label: { Self.item("Move Up", "arrow.up", .systemIndigo) }
 +                .disabled(model.visibleRows.first?.key == row.key)
-+            Button("Move Down") { model.move(row, by: 1) }
++            Button { model.move(row, by: 1) } label: { Self.item("Move Down", "arrow.down", .systemIndigo) }
 +                .disabled(model.visibleRows.last?.key == row.key)
-+            Menu("Colourise") {
++            Menu {
 +                ForEach(DockTag.offered + (row.tag.map { DockTag.offered.contains($0) ? [] : [$0] } ?? []), id: \.self) { tag in
 +                    if tag == .blue || tag == .blaze || !DockTag.offered.contains(tag) { Divider() }
 +                    Button { model.setTag(row, tag) } label: {
@@ -9615,24 +11194,40 @@ index 0000000..e7e8690
 +                }
 +                .disabled(row.tag == nil)
 +                Button("None") { model.setTag(row, nil) }.disabled(row.tag == nil)
-+            }
++            } label: { Self.item("Colourise", "paintpalette", .systemPink) }
 +            Divider()
 +            if row.sessionId != nil {
 +                if DockSessions.burstInstalled {
-+                    Button("Compact (Pauseless)", action: onCompact).disabled(!canCompact || compacting)
++                    Button(action: onCompact) { Self.item("Compact (Pauseless)", "arrow.down.right.and.arrow.up.left", .systemOrange) }.disabled(!canCompact || compacting)
 +                } else {
-+                    Button("Compact (Pauseless)… needs Claude Burst", action: onCompact)
++                    Button(action: onCompact) { Self.item("Compact (Pauseless)… needs Claude Burst", "arrow.down.right.and.arrow.up.left", .systemOrange) }
 +                }
-+                Button("Restart Session", action: onRestart).disabled(restarting)
-+                Button("Undock to Its Own Window", action: onUndock).disabled(undocking)
++                Button(action: onRestart) { Self.item("Restart Session", "arrow.clockwise", .systemGreen) }.disabled(restarting)
++                Button(action: onUndock) { Self.item("Undock to Its Own Window", "arrow.up.right.square", .systemBlue) }.disabled(undocking)
 +            }
 +            if row.failed {
-+                Button("Try Again") {
++                Button {
 +                    row.controller?.surfaceTree.filter { $0.error != nil }.forEach(DockSurfaceRetry.retry)
-+                }
++                } label: { Self.item("Try Again", "arrow.counterclockwise", .systemOrange) }
 +            }
-+            Button("Close Tab", action: onClose)
++            Button(action: onClose) { Self.item("Close Tab", "xmark", .systemRed) }
 +        }
++    }
++
++    /// A menu item with its icon in colour: menus tint symbol images, so
++    /// the symbol is drawn into a plain image first.
++    static func item(_ title: String, _ symbol: String, _ color: NSColor) -> some View {
++        Label { Text(title) } icon: { Image(nsImage: icon(symbol, color)) }
++    }
++
++    static func icon(_ symbol: String, _ color: NSColor) -> NSImage {
++        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
++            .applying(.init(paletteColors: [color]))
++        guard let sym = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
++            .withSymbolConfiguration(config) else { return NSImage() }
++        let img = NSImage(size: sym.size, flipped: false) { r in sym.draw(in: r); return true }
++        img.isTemplate = false
++        return img
 +    }
 +
 +    /// A dot of the tag's colour for the menu: menus tint symbol images,
@@ -9651,7 +11246,8 @@ index 0000000..e7e8690
 +    private var accent: Color { row.tag.map(DockPalette.color) ?? DockPalette.blue }
 +
 +    private func subtitle(now: Date) -> String {
-+        let label = DockPalette.label(row.status)
++        let label = row.scripting ? (row.scripts == 1 ? "Waiting on a script" : "Waiting on \(row.scripts) scripts")
++            : DockPalette.label(row.status)
 +        var parts = [label]
 +        if let since = row.since { parts.append(elapsed(now.timeIntervalSince(since))) }
 +        // How full its context is: compact before it fills.
@@ -10027,16 +11623,14 @@ index 0000000..e7e8690
 +                    .foregroundStyle(DockPalette.grey)
 +                    .lineLimit(1)
 +                    .truncationMode(.middle)
-+                Text(session.moving ? "Docking…"
-+                     : session.busy ? "Undocked · busy" : "Undocked")
++                Text(subtitle)
 +                    .font(.system(size: 10.5))
 +                    .foregroundStyle(DockPalette.grey)
 +                    .lineLimit(1)
 +            }
 +            Spacer(minLength: 0)
 +            DockIconButton(symbol: "arrow.down.left.square", busy: session.moving,
-+                           help: session.moving ? "Docking…" : "Dock into a tab here",
-+                           action: onDock)
++                           help: dockHelp, action: onDock)
 +        }
 +        .padding(.horizontal, 8)
 +        .padding(.vertical, 6)
@@ -10047,7 +11641,30 @@ index 0000000..e7e8690
 +        )
 +        .contentShape(Rectangle())
 +        .onHover { hover = $0 }
-+        .help(session.cwd)
++        .help(session.shell
++              ? "A Ghostty of its own with no Claude session. Click to show it."
++              : session.cwd)
++    }
++
++    private var waitingOn: String { session.programs.joined(separator: ", ") }
++
++    private var dockHelp: String {
++        if session.moving { return session.shell && session.busy ? "Docks when \(waitingOn) finishes" : "Docking…" }
++        if session.shell {
++            return session.busy
++                ? "Dock its tabs here as shells once \(waitingOn) finishes; stopping it now would lose its work"
++                : "Dock its tabs here as shells, in the same folders"
++        }
++        return "Dock into a tab here"
++    }
++
++    private var subtitle: String {
++        if session.shell {
++            let tabs = "\(session.tabs) tab\(session.tabs == 1 ? "" : "s")"
++            if session.programs.isEmpty { return session.moving ? "Docking…" : "Shells · \(tabs)" }
++            return session.moving ? "Docks when \(waitingOn) finishes" : "Running \(waitingOn) · \(tabs)"
++        }
++        return session.moving ? "Docking…" : session.busy ? "Undocked · busy" : "Undocked"
 +    }
 +}
 +
@@ -10118,18 +11735,118 @@ index 0000000..e7e8690
 +    }
 +}
 +
-+/// Hands back the window a view is in, once it is in one.
++/// Hands back the window a view is in, once it is in one, and again when it
++/// moves to another: a sidebar moves to whichever tab is in front.
 +struct DockWindowReader: NSViewRepresentable {
 +    var found: (NSWindow?) -> Void
 +
-+    func makeNSView(context: Context) -> NSView {
-+        let v = NSView()
++    final class Reader: NSView {
++        var found: (NSWindow?) -> Void = { _ in }
++
++        override func viewDidMoveToWindow() {
++            super.viewDidMoveToWindow()
++            guard let window else { return }
++            DispatchQueue.main.async { [found] in found(window) }
++        }
++    }
++
++    func makeNSView(context: Context) -> Reader {
++        let v = Reader()
++        v.found = found
 +        DispatchQueue.main.async { found(v.window) }
 +        return v
 +    }
 +
-+    func updateNSView(_ v: NSView, context: Context) {
++    func updateNSView(_ v: Reader, context: Context) {
++        v.found = found
 +        DispatchQueue.main.async { if v.window != nil { found(v.window) } }
++    }
++}
++
++/// Where a tab's sidebar goes. Only the tab in front of each window has
++/// one: the sidebars are lent to whichever tab is in front and handed back
++/// when it goes behind another. One each, 14 tabs kept 14 sidebars up to
++/// date with every change, those out of sight too.
++final class DockSidebarSlot: NSView {
++    private static var slots: [Weak] = []
++    private static var spare: NSHostingView<DockSidebarView>?
++    private static var watching = false
++    private struct Weak { weak var slot: DockSidebarSlot? }
++
++    private let onNewTab: () -> Void
++    private var hosted: NSHostingView<DockSidebarView>?
++
++    init(onNewTab: @escaping () -> Void) {
++        self.onNewTab = onNewTab
++        super.init(frame: .zero)
++        Self.slots.append(Weak(slot: self))
++        Self.watch()
++    }
++
++    required init?(coder: NSCoder) { fatalError("not used") }
++
++    override var isFlipped: Bool { true }
++
++    override func layout() {
++        super.layout()
++        hosted?.frame = bounds
++    }
++
++    override func viewDidMoveToWindow() {
++        super.viewDidMoveToWindow()
++        Self.lend()
++    }
++
++    /// The tab in front of its window.
++    private var inFront: Bool {
++        guard let window else { return false }
++        return (window.tabGroup?.selectedWindow ?? window) === window
++    }
++
++    private static func watch() {
++        guard !watching else { return }
++        watching = true
++        let names: [Notification.Name] = [NSWindow.didBecomeKeyNotification,
++                                          NSWindow.didBecomeMainNotification,
++                                          NSWindow.didChangeOcclusionStateNotification]
++        for name in names {
++            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in lend() }
++        }
++    }
++
++    /// Takes the sidebars back from tabs gone behind another, then gives
++    /// them to the tabs in front that have none.
++    private static func lend() {
++        slots.removeAll { $0.slot == nil }
++        let all = slots.compactMap(\.slot)
++        for slot in all where !slot.inFront { slot.giveBack() }
++        for slot in all where slot.inFront && slot.hosted == nil { slot.borrow() }
++    }
++
++    private func borrow() {
++        let view = Self.spare ?? {
++            let view = NSHostingView(rootView: DockSidebarView(onNewTab: onNewTab))
++            view.sizingOptions = []
++            return view
++        }()
++        Self.spare = nil
++        view.frame = bounds
++        view.autoresizingMask = [.width, .height]
++        addSubview(view)
++        hosted = view
++    }
++
++    private func giveBack() {
++        guard let view = hosted else { return }
++        hosted = nil
++        view.removeFromSuperview()
++        // One kept for the next tab to come to the front; more would only
++        // be kept up to date for nothing.
++        if Self.spare == nil { Self.spare = view }
++    }
++
++    deinit {
++        if let view = hosted, Self.spare == nil { Self.spare = view }
 +    }
 +}
 +
@@ -10152,13 +11869,87 @@ index 0000000..e7e8690
 +    private struct Hosted: NSViewRepresentable {
 +        var onNewTab: () -> Void
 +
-+        func makeNSView(context: Context) -> NSHostingView<DockSidebarView> {
-+            let view = NSHostingView(rootView: DockSidebarView(onNewTab: onNewTab))
-+            view.sizingOptions = []
-+            return view
++        func makeNSView(context: Context) -> DockSidebarSlot {
++            DockSidebarSlot(onNewTab: onNewTab)
 +        }
 +
-+        func updateNSView(_ view: NSHostingView<DockSidebarView>, context: Context) {}
++        func updateNSView(_ view: DockSidebarSlot, context: Context) {}
++    }
++}
++
++/// The dotted line joining a child terminal to its session: down the gutter
++/// from the row above, then across to the row. It runs on down past a row
++/// with another child under it.
++struct DockChildLine: View {
++    var start: CGFloat = 0
++    var width: CGFloat
++    var moreBelow: Bool
++
++    var body: some View {
++        GeometryReader { g in
++            Path { p in
++                let x: CGFloat = start + 7, mid = g.size.height / 2
++                p.move(to: CGPoint(x: x, y: -3))
++                p.addLine(to: CGPoint(x: x, y: moreBelow ? g.size.height + 3 : mid))
++                p.move(to: CGPoint(x: x, y: mid))
++                p.addLine(to: CGPoint(x: width + 2, y: mid))
++            }
++            .stroke(DockPalette.grey.opacity(0.8), style: StrokeStyle(lineWidth: 1.2, lineCap: .round, dash: [1.5, 3]))
++        }
++        .frame(width: width + 2)
++        .allowsHitTesting(false)
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockStaleLogin.swift b/macos/Sources/Features/Dock/DockStaleLogin.swift
+new file mode 100644
+index 0000000..1930311
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockStaleLogin.swift
+@@ -0,0 +1,46 @@
++import Darwin
++import Foundation
++
++/// Sessions left behind by a login that has ended. A tab's holder outlives
++/// a logout or a login window crash, and Ghostty Dock reattaches it after
++/// the next login, but what runs in it is still in the old login session:
++/// it can't look up hosts, read the Keychain, use the clipboard or open
++/// apps. Resuming the session from the app puts it in the current login.
++/// Only needs Foundation; DockSessions does the resuming.
++enum DockStaleLogin {
++    /// The sessions whose claude started before `loginAt`.
++    static func stale(_ sessions: [(sid: String, started: Date)], loginAt: Date) -> [String] {
++        sessions.filter { $0.started < loginAt.addingTimeInterval(-5) }.map(\.sid)
++    }
++
++    /// When a process started.
++    static func started(_ pid: pid_t) -> Date? {
++        var kp = kinfo_proc()
++        var len = MemoryLayout<kinfo_proc>.stride
++        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
++        guard sysctl(&mib, 4, &kp, &len, nil, 0) == 0, len > 0 else { return nil }
++        let t = kp.kp_proc.p_un.__p_starttime
++        return Date(timeIntervalSince1970: Double(t.tv_sec) + Double(t.tv_usec) / 1e6)
++    }
++
++    /// When this login began: the start of this user's newest loginwindow,
++    /// which macOS starts afresh for every login.
++    static func loginAt() -> Date? {
++        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(getuid())]
++        var len = 0
++        guard sysctl(&mib, 4, nil, &len, nil, 0) == 0, len > 0 else { return nil }
++        var procs = [kinfo_proc](repeating: kinfo_proc(), count: len / MemoryLayout<kinfo_proc>.stride + 16)
++        len = procs.count * MemoryLayout<kinfo_proc>.stride
++        guard sysctl(&mib, 4, &procs, &len, nil, 0) == 0 else { return nil }
++        let count = len / MemoryLayout<kinfo_proc>.stride
++        var newest: Date?
++        for var p in procs.prefix(count) {
++            let name = withUnsafeBytes(of: &p.kp_proc.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
++            guard name == "loginwindow" else { continue }
++            let t = p.kp_proc.p_un.__p_starttime
++            let at = Date(timeIntervalSince1970: Double(t.tv_sec) + Double(t.tv_usec) / 1e6)
++            if newest.map({ at > $0 }) ?? true { newest = at }
++        }
++        return newest
 +    }
 +}
 diff --git a/macos/Sources/Features/Dock/DockSurfaceError.swift b/macos/Sources/Features/Dock/DockSurfaceError.swift
@@ -10274,10 +12065,10 @@ index 0000000..f0b8d41
 +}
 diff --git a/macos/Sources/Features/Dock/DockTheme.swift b/macos/Sources/Features/Dock/DockTheme.swift
 new file mode 100644
-index 0000000..cf53b7e
+index 0000000..9f9b28a
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockTheme.swift
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,207 @@
 +import AppKit
 +import SwiftUI
 +
@@ -10286,16 +12077,28 @@ index 0000000..cf53b7e
 +/// choice lives in Ghostty Dock's settings, so stock Ghostty's config is
 +/// never touched; Ghostty Dock loads it after that config (see Ghostty.Config).
 +enum DockTheme {
-+    /// Twenty that look good with the sidebar, dark first. Each is a Ghostty
-+    /// theme of exactly this name.
-+    static let choices: [String] = [
-+        "Catppuccin Mocha", "Catppuccin Macchiato", "Catppuccin Frappe",
-+        "TokyoNight Storm", "TokyoNight Night", "Dracula", "Nord", "Gruvbox Dark",
-+        "Rose Pine", "Kanagawa Wave", "Everforest Dark Hard", "One Half Dark",
-+        "GitHub Dark Default", "Monokai Pro",
-+        "Catppuccin Latte", "GitHub Light Default", "Rose Pine Dawn",
-+        "iTerm2 Solarized Light", "Gruvbox Light", "TokyoNight Day",
++    /// Ones that look good with the sidebar, in groups for the picker. Each
++    /// is a Ghostty theme of exactly this name.
++    static let groups: [(title: String, names: [String])] = [
++        ("Dark", [
++            "Catppuccin Mocha", "Catppuccin Macchiato", "Catppuccin Frappe",
++            "TokyoNight Storm", "TokyoNight Night", "Dracula", "Dracula+", "Nord", "Gruvbox Dark",
++            "Rose Pine", "Rose Pine Moon", "Kanagawa Wave", "Everforest Dark Hard", "One Half Dark",
++            "GitHub Dark Default", "Monokai Pro", "Ayu Mirage", "Material Ocean",
++        ]),
++        ("Electric", [
++            "Synthwave", "SynthWave Alpha", "Synthwave Everything", "Cyberpunk", "Shades Of Purple",
++            "Laser", "Neon", "Electron Highlighter", "Cobalt Neon", "Andromeda", "Poimandres",
++            "Night Owl", "Fairyfloss", "Matrix", "Red Planet", "Hot Dog Stand",
++        ]),
++        ("Light", [
++            "Catppuccin Latte", "GitHub Light Default", "Rose Pine Dawn",
++            "iTerm2 Solarized Light", "Gruvbox Light", "TokyoNight Day",
++            "Ayu Light", "Flexoki Light", "Everforest Light Med",
++        ]),
 +    ]
++
++    static var choices: [String] { groups.flatMap(\.names) }
 +
 +    /// "" means whatever the Ghostty config says.
 +    static var selected: String { UserDefaults.standard.string(forKey: DockSettings.themeKey) ?? "" }
@@ -10475,10 +12278,10 @@ index 0000000..cf53b7e
 +}
 diff --git a/macos/Sources/Features/Dock/DockTint.swift b/macos/Sources/Features/Dock/DockTint.swift
 new file mode 100644
-index 0000000..0af6f7f
+index 0000000..a6e3621
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockTint.swift
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,169 @@
 +import AppKit
 +import GhosttyKit
 +import SwiftUI
@@ -10518,7 +12321,8 @@ index 0000000..0af6f7f
 +                let id = ObjectIdentifier(view)
 +                seen.insert(id)
 +                guard applied[id] != want else { continue }
-+                guard let surface = view.surface, set(surface, background: want) else { continue }
++                guard let surface = view.surface,
++                      set(surface, background: want, prompt: row.tag.map(Self.promptBackground)) else { continue }
 +                applied[id] = want
 +            }
 +        }
@@ -10590,24 +12394,43 @@ index 0000000..0af6f7f
 +
 +    /// The theme's background with some of the colour mixed in.
 +    static func background(_ tag: DockTag) -> Int {
++        mixed(tag, strength)
++    }
++
++    /// How much of the colour goes into the band behind your prompts.
++    private static let promptStrength = 0.45
++
++    /// The band behind your prompts in Claude Code: much more of the colour
++    /// than the background, so what you typed stands out from its output.
++    static func promptBackground(_ tag: DockTag) -> Int {
++        mixed(tag, promptStrength)
++    }
++
++    /// The palette slot Claude Code's Ghostty Dock theme draws your prompts
++    /// on (install.sh): 255 in light, 237 in dark. Outside Ghostty Dock each
++    /// is about the grey Claude uses anyway.
++    static var promptSlot: Int { DockPalette.scheme == .dark ? 237 : 255 }
++
++    private static func mixed(_ tag: DockTag, _ amount: Double) -> Int {
 +        let base = NSColor(DockPalette.base).usingColorSpace(.sRGB) ?? .black
 +        let mix = { (from: CGFloat, shift: Int) -> Int in
 +            let to = Double((tag.hex >> shift) & 0xff) / 255
-+            return Int(((Double(from) + (to - Double(from)) * strength) * 255).rounded())
++            return Int(((Double(from) + (to - Double(from)) * amount) * 255).rounded())
 +        }
 +        return mix(base.redComponent, 16) << 16 | mix(base.greenComponent, 8) << 8 | mix(base.blueComponent, 0)
 +    }
 +
 +    /// Gives one surface the app's config with this background, or the
 +    /// app's own config back with nil.
-+    private func set(_ surface: ghostty_surface_t, background: Int?) -> Bool {
++    private func set(_ surface: ghostty_surface_t, background: Int?, prompt: Int?) -> Bool {
 +        guard let ghostty = (NSApp.delegate as? AppDelegate)?.ghostty else { return false }
 +        guard let background else {
 +            ghostty.reloadConfig(surface: surface, soft: true)
 +            return true
 +        }
 +        let file = FileManager.default.temporaryDirectory.appendingPathComponent("ghostty-dock-tint.conf")
-+        guard (try? String(format: "background = #%06x\n", background)
++        let prompt = prompt.map { String(format: "palette = %d=#%06x\n", Self.promptSlot, $0) } ?? ""
++        guard (try? (String(format: "background = #%06x\n", background) + prompt)
 +            .write(to: file, atomically: true, encoding: .utf8)) != nil else { return false }
 +        let config = Ghostty.Config(config: Self.load(extra: file.path))
 +        guard let c = config.config else { return false }
@@ -10626,6 +12449,50 @@ index 0000000..0af6f7f
 +        ghostty_config_load_file(cfg, extra)
 +        ghostty_config_finalize(cfg)
 +        return cfg
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockTitlebarDoubleClick.swift b/macos/Sources/Features/Dock/DockTitlebarDoubleClick.swift
+new file mode 100644
+index 0000000..0a5e412
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockTitlebarDoubleClick.swift
+@@ -0,0 +1,38 @@
++import AppKit
++
++/// Double-clicking the title bar zooms the window (or minimises it, or does
++/// nothing: System Settings › Desktop & Dock). AppKit's own handling never
++/// sees the click: the window's content reaches up under the title bar and
++/// takes it, as does the centred title (DockCenteredTitle). With two or more
++/// tabs the tabs fill the title bar, so a tab zooms too; ⌥-double-click
++/// renames it (TabTitleEditor), as does its right-click menu.
++enum DockTitlebarDoubleClick {
++    /// True when the event was a title bar double-click, now handled.
++    static func handle(_ event: NSEvent, in window: NSWindow) -> Bool {
++        guard event.type == .leftMouseDown, event.clickCount == 2,
++              !event.modifierFlags.contains(.option),
++              window.styleMask.contains(.titled), !window.styleMask.contains(.fullScreen),
++              event.locationInWindow.y >= window.contentLayoutRect.maxY,
++              !onControl(event, in: window) else { return false }
++        switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
++        case "None": break
++        case "Minimize": window.performMiniaturize(nil)
++        default: window.performZoom(nil)
++        }
++        return true
++    }
++
++    /// The window buttons, a tab's close button, the new tab button, or a tab
++    /// title being edited: each takes its own clicks.
++    private static func onControl(_ event: NSEvent, in window: NSWindow) -> Bool {
++        guard let frame = window.contentView?.superview else { return false }
++        var view = frame.hitTest(frame.convert(event.locationInWindow, from: nil))
++        while let v = view, v !== frame {
++            if v is NSText { return true }
++            if let field = v as? NSTextField { if field.isEditable { return true } }
++            else if v is NSControl { return true }
++            view = v.superview
++        }
++        return false
 +    }
 +}
 diff --git a/macos/Sources/Features/Dock/DockTitles.swift b/macos/Sources/Features/Dock/DockTitles.swift
@@ -11102,12 +12969,687 @@ index 0000000..ecd048f
 +        return (r.status, r.text)
 +    }
 +}
+diff --git a/macos/Sources/Features/Dock/DockViewer.swift b/macos/Sources/Features/Dock/DockViewer.swift
+new file mode 100644
+index 0000000..d4b0ede
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockViewer.swift
+@@ -0,0 +1,346 @@
++import AppKit
++import UniformTypeIdentifiers
++import WebKit
++
++/// Ghostty Dock: a file viewer beside the terminal (⌘⇧E), one per tab. A
++/// ⌘-click on a file name in the terminal, a plan.md Claude Code just wrote
++/// say, opens it here instead of in another app: Markdown rendered, source
++/// and text files highlighted, images and PDFs as they are. It reloads as
++/// the file changes.
++///
++/// Each file is a WKWebView on dockview://app/viewer.html#<path>, the page
++/// in Resources/viewer of the repo; the page reads the file from
++/// dockview://app/f<path>, the same origin (DockViewerScheme).
++@MainActor
++enum DockViewer {
++    static let widthKey = "dock.viewer.width"
++    static let scheme = "dockview"
++    /// Bigger files open in their usual app.
++    static let sizeLimit = 20 * 1024 * 1024
++
++    private static var models: [ObjectIdentifier: DockViewerModel] = [:]
++    private static let markdown: Set<String> = ["md", "markdown", "mdown", "mkd", "mdx"]
++    /// Shown by the page, or by WebKit itself (PDFs).
++    private static let media: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico",
++                                             "tif", "tiff", "heic", "pdf"]
++    /// Text, but better in a browser.
++    private static let elsewhere: Set<String> = ["html", "htm", "xhtml", "webloc"]
++
++    /// The viewer of the tab that owns it (its TerminalController).
++    static func model(for owner: AnyObject) -> DockViewerModel {
++        let id = ObjectIdentifier(owner)
++        if let m = models[id] { return m }
++        let m = DockViewerModel(owner: owner as? BaseTerminalController)
++        models[id] = m
++        return m
++    }
++
++    /// The tab closed: its viewer goes with it.
++    static func forget(_ owner: AnyObject) {
++        models.removeValue(forKey: ObjectIdentifier(owner))?.close()
++    }
++
++    /// ⌘⇧E: shows or hides the key tab's viewer.
++    static func toggle() {
++        guard let controller = NSApp.keyWindow?.windowController as? TerminalController else {
++            NSSound.beep()
++            return
++        }
++        model(for: controller).toggle()
++    }
++
++    /// A link ⌘-clicked in `surface`: opens it in the viewer beside it when
++    /// it is a file the viewer shows. False leaves it to the usual app.
++    static func open(_ clicked: URL, from surface: Ghostty.SurfaceView?) -> Bool {
++        guard let controller = surface?.window?.windowController as? TerminalController else { return false }
++        let url = DockViewerPath.located(clicked, in: surface?.pwd)
++        guard viewable(url) else {
++            // A name Claude Code broke across lines comes here cut short.
++            if url.isFileURL {
++                let why = FileManager.default.fileExists(atPath: url.path) ? "not a kind it shows" : "no such file"
++                DockLog.files.notice("viewer: left \(url.path, privacy: .public) to its app: \(why, privacy: .public)")
++            }
++            return false
++        }
++        model(for: controller).open(url)
++        DockLog.files.notice("viewer: opened \(url.path, privacy: .public)")
++        return true
++    }
++
++    /// `ghostty-dock view <file>`: the file in the viewer of the terminal
++    /// tab holding `surface`, else the key window's.
++    static func open(path: String, surface: String?, show: Bool) -> [String: Any] {
++        let url = URL(filePath: NSString(string: path).standardizingPath)
++        guard viewable(url) else { return ["ok": false, "error": "not a file the viewer shows: \(url.path)"] }
++        let holding = surface.flatMap { id in
++            id.isEmpty ? nil : TerminalController.all.first { $0.surfaceTree.contains { $0.id.uuidString == id } }
++        }
++        guard let owner = holding ?? NSApp.keyWindow?.windowController as? TerminalController
++            ?? TerminalController.all.first else { return ["ok": false, "error": "no terminal window is open"] }
++        model(for: owner).open(url, show: show)
++        return ["ok": true, "path": url.path]
++    }
++
++    /// A local file, not too big, that is Markdown, an image or PDF, or text.
++    static func viewable(_ url: URL) -> Bool {
++        guard url.isFileURL,
++              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
++              values.isRegularFile == true, (values.fileSize ?? 0) <= sizeLimit else { return false }
++        let ext = url.pathExtension.lowercased()
++        if elsewhere.contains(ext) { return false }
++        if markdown.contains(ext) || media.contains(ext) { return true }
++        if let type = UTType(filenameExtension: ext), type.conforms(to: .text) || type.conforms(to: .sourceCode) {
++            return true
++        }
++        return looksLikeText(url)
++    }
++
++    static func isPDF(_ url: URL) -> Bool { url.pathExtension.lowercased() == "pdf" }
++
++    /// No NUL bytes, and UTF-8, in its first 8 KB: for names macOS does not
++    /// know (a .zig, a Makefile).
++    private static func looksLikeText(_ url: URL) -> Bool {
++        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
++        defer { try? handle.close() }
++        let head = (try? handle.read(upToCount: 8192)) ?? Data()
++        if head.isEmpty { return true }
++        if head.contains(0) { return false }
++        // A cut in the middle of a character at the end is fine.
++        for drop in 0...3 where String(data: head.dropLast(drop), encoding: .utf8) != nil { return true }
++        return false
++    }
++
++
++    static func pageURL(for file: URL) -> URL? {
++        if isPDF(file) { return fileURL(file.path) }
++        var c = URLComponents()
++        c.scheme = scheme
++        c.host = "app"
++        c.path = "/viewer.html"
++        c.fragment = file.path
++        return c.url
++    }
++
++    /// Where the page reads a file from.
++    static let filePrefix = "/f"
++
++    static func fileURL(_ path: String) -> URL? {
++        var c = URLComponents()
++        c.scheme = scheme
++        c.host = "app"
++        c.path = filePrefix + path
++        return c.url
++    }
++
++}
++
++/// One file in a viewer: its page, and a watch on the file that reloads it.
++@MainActor
++final class DockViewerFile: ObservableObject, Identifiable {
++    let url: URL
++    let view: WKWebView
++    private var source: DispatchSourceFileSystemObject?
++    private var pending: DispatchWorkItem?
++
++    var label: String { url.lastPathComponent }
++
++    init(url: URL, configuration: WKWebViewConfiguration, delegate: WKNavigationDelegate) {
++        self.url = url
++        view = WKWebView(frame: .zero, configuration: configuration)
++        view.navigationDelegate = delegate
++        view.setValue(false, forKey: "drawsBackground")
++        if let page = DockViewer.pageURL(for: url) { view.load(URLRequest(url: page)) }
++        watch()
++    }
++
++    func reload() {
++        if DockViewer.isPDF(url) {
++            view.reload()
++        } else {
++            view.evaluateJavaScript("window.dockReload && dockReload()")
++        }
++    }
++
++    func stop() {
++        pending?.cancel()
++        source?.cancel()
++        source = nil
++        view.removeFromSuperview()
++    }
++
++    /// Editors, Claude Code's among them, often write a new file and rename
++    /// it over the old: the watch then follows the new file.
++    private func watch() {
++        source?.cancel()
++        let fd = Darwin.open(url.path, O_EVTONLY)
++        guard fd >= 0 else {
++            // Gone for a moment while it is replaced: look again shortly.
++            schedule(after: 0.5) { [weak self] in self?.watch(); self?.reload() }
++            return
++        }
++        let s = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
++                                                          eventMask: [.write, .extend, .delete, .rename],
++                                                          queue: .main)
++        s.setEventHandler { [weak self, weak s] in
++            MainActor.assumeIsolated {
++                guard let self, let s else { return }
++                if !s.data.intersection([.delete, .rename]).isEmpty {
++                    self.schedule(after: 0.2) { [weak self] in self?.watch(); self?.reload() }
++                } else {
++                    self.schedule(after: 0.15) { [weak self] in self?.reload() }
++                }
++            }
++        }
++        s.setCancelHandler { Darwin.close(fd) }
++        s.resume()
++        source = s
++    }
++
++    private func schedule(after secs: Double, _ work: @escaping @MainActor () -> Void) {
++        pending?.cancel()
++        let item = DispatchWorkItem { MainActor.assumeIsolated { work() } }
++        pending = item
++        DispatchQueue.main.asyncAfter(deadline: .now() + secs, execute: item)
++    }
++}
++
++/// A terminal tab's viewer: its files and the one showing.
++@MainActor
++final class DockViewerModel: NSObject, ObservableObject, WKNavigationDelegate {
++    @Published private(set) var open = false
++    @Published private(set) var files: [DockViewerFile] = []
++    @Published private(set) var selected: DockViewerFile?
++    private weak var owner: BaseTerminalController?
++
++    private lazy var configuration: WKWebViewConfiguration = {
++        let c = WKWebViewConfiguration()
++        c.setURLSchemeHandler(DockViewerScheme(), forURLScheme: DockViewer.scheme)
++        c.userContentController.add(DockViewerLog(), name: "viewer")
++        return c
++    }()
++
++    fileprivate init(owner: BaseTerminalController?) {
++        self.owner = owner
++    }
++
++    func toggle() {
++        if open {
++            hide()
++        } else if files.isEmpty {
++            NSSound.beep()
++        } else {
++            open = true
++        }
++    }
++
++    /// The file's tab, a new one if it has none, in front; shown if `show`.
++    func open(_ url: URL, show: Bool = true) {
++        if let file = files.first(where: { $0.url == url }) {
++            select(file)
++            file.reload()
++        } else {
++            let file = DockViewerFile(url: url, configuration: configuration, delegate: self)
++            files.append(file)
++            select(file)
++        }
++        if show { open = true }
++    }
++
++    func select(_ file: DockViewerFile) {
++        if let selected, selected !== file, hasKeyboard(selected) { returnKeyboard() }
++        selected = file
++    }
++
++    /// A tab's ×. The last one closes the viewer.
++    func close(_ file: DockViewerFile) {
++        guard let i = files.firstIndex(where: { $0 === file }) else { return }
++        let keyboard = hasKeyboard(file)
++        files.remove(at: i)
++        file.stop()
++        if selected === file {
++            selected = nil
++            if !files.isEmpty { select(files[min(i, files.count - 1)]) }
++        }
++        if files.isEmpty {
++            if open { open = false; returnKeyboard() }
++        } else if keyboard {
++            returnKeyboard()
++        }
++    }
++
++    /// The bar's ×: every file closes.
++    func close() {
++        let wasOpen = open
++        files.forEach { $0.stop() }
++        files = []
++        selected = nil
++        open = false
++        if wasOpen { returnKeyboard() }
++    }
++
++    func openElsewhere() {
++        guard let url = selected?.url else { return }
++        NSWorkspace.shared.open(url)
++    }
++
++    func revealInFinder() {
++        guard let url = selected?.url else { return }
++        NSWorkspace.shared.activateFileViewerSelecting([url])
++    }
++
++    /// Hidden, the viewer must not keep the keyboard.
++    private func hide() {
++        open = false
++        returnKeyboard()
++    }
++
++    private func returnKeyboard() {
++        guard let owner, let window = owner.window,
++              let surface = owner.focusedSurface ?? owner.surfaceTree.first else { return }
++        window.makeFirstResponder(surface)
++    }
++
++    private func hasKeyboard(_ file: DockViewerFile) -> Bool {
++        guard let responder = file.view.window?.firstResponder as? NSView else { return false }
++        return responder.isDescendant(of: file.view)
++    }
++
++    // MARK: WKNavigationDelegate
++
++    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: any Error) {
++        DockLog.files.error("viewer: \(webView.url?.absoluteString ?? "", privacy: .public) did not load: \(error.localizedDescription, privacy: .public)")
++    }
++
++    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: any Error) {
++        DockLog.files.error("viewer: \(webView.url?.absoluteString ?? "", privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
++    }
++
++    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
++        DockLog.files.error("viewer: its web process ended; reloading")
++        webView.reload()
++    }
++
++    /// A link clicked in a file: another file the viewer shows opens in a
++    /// tab of its own, a web page in the browser beside it, anything else in
++    /// its usual app.
++    func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
++                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
++        guard action.navigationType == .linkActivated, let url = action.request.url else {
++            decisionHandler(.allow)
++            return
++        }
++        decisionHandler(.cancel)
++        if let file = DockViewerScheme.file(of: url) {
++            if DockViewer.viewable(file) { open(file) } else { NSWorkspace.shared.open(file) }
++        } else if !DockBrowser.open(url, in: owner) {
++            NSWorkspace.shared.open(url)
++        }
++    }
++}
++
++/// The page's errors, in the app's log.
++private final class DockViewerLog: NSObject, WKScriptMessageHandler {
++    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
++        DockLog.files.error("viewer page: \(String(describing: message.body), privacy: .public)")
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockViewerPath.swift b/macos/Sources/Features/Dock/DockViewerPath.swift
+new file mode 100644
+index 0000000..25ab0f9
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockViewerPath.swift
+@@ -0,0 +1,22 @@
++import Foundation
++
++/// Where a ⌘-clicked file name really is. Ghostty keeps the full stop that
++/// ends a sentence in a path ("see plans/plan.md."), and passes a relative
++/// name it could not find on as it is, which then reads as one under "/".
++enum DockViewerPath {
++    private static let trailing: Set<Character> = [".", ",", ":", ";", "!", "?", ")", "'", "\"", "`"]
++
++    /// The file `url` names, with what ended the sentence dropped and a
++    /// relative name looked for in `folder` (the terminal's). `url` as it
++    /// was when that finds nothing either.
++    static func located(_ url: URL, in folder: String?) -> URL {
++        let files = FileManager.default
++        guard url.isFileURL, !files.fileExists(atPath: url.path) else { return url }
++        let relative = url.baseURL != nil
++        var name = relative ? url.relativePath : url.path
++        while let last = name.last, trailing.contains(last) { name.removeLast() }
++        let candidates = relative ? [folder.map { ($0 as NSString).appendingPathComponent(name) }, "/" + name] : [name]
++        guard let found = candidates.compactMap({ $0 }).first(where: { files.fileExists(atPath: $0) }) else { return url }
++        return URL(filePath: found)
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockViewerScheme.swift b/macos/Sources/Features/Dock/DockViewerScheme.swift
+new file mode 100644
+index 0000000..f54a3e0
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockViewerScheme.swift
+@@ -0,0 +1,78 @@
++import Foundation
++import UniformTypeIdentifiers
++import WebKit
++
++/// Serves dockview://app/f<path> from disk and the rest of dockview://app/
++/// from the viewer's page folder.
++final class DockViewerScheme: NSObject, WKURLSchemeHandler {
++    /// Where the page and its scripts are, in the app's resources.
++    nonisolated(unsafe) static var pageFolder: URL? = Bundle.main.resourceURL?.appendingPathComponent("viewer")
++
++    /// The file a dockview:// address names, if it names one.
++    static func file(of url: URL) -> URL? {
++        guard url.scheme == "dockview", url.host == "app", url.path.hasPrefix("/f/") else { return nil }
++        return URL(filePath: String(url.path.dropFirst(2)))
++    }
++
++    private var stopped = Set<ObjectIdentifier>()
++
++    func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
++        guard let url = task.request.url else { return fail(task, 400, "no address") }
++        let file: URL
++        let page: Bool
++        if let named = Self.file(of: url) {
++            file = named
++            page = false
++        } else if url.host == "app" {
++            guard let folder = Self.pageFolder else {
++                return fail(task, 404, "the viewer's page is missing")
++            }
++            let candidate = folder.appendingPathComponent(url.path).standardizedFileURL
++            // Nothing outside the page's folder.
++            guard candidate.path.hasPrefix(folder.standardizedFileURL.path + "/") else {
++                return fail(task, 403, "outside the viewer")
++            }
++            file = candidate
++            page = true
++        } else {
++            return fail(task, 404, "unknown")
++        }
++        let data: Data
++        do {
++            data = try Data(contentsOf: file, options: .mappedIfSafe)
++        } catch {
++            return fail(task, 404, error.localizedDescription)
++        }
++        respond(task, url, 200, Self.mime(file, page: page), data)
++    }
++
++    /// The page's own files as what they are; a user's file as an image or
++    /// PDF, else as text, whatever it is: the page decides how to show it,
++    /// and an .html or .svg of theirs must never run as a page.
++    private static func mime(_ file: URL, page: Bool) -> String {
++        let type = UTType(filenameExtension: file.pathExtension)
++        if page, let m = type?.preferredMIMEType { return m.hasPrefix("text/") ? m + "; charset=utf-8" : m }
++        if let type, type.conforms(to: .pdf) || (type.conforms(to: .image) && type != .svg),
++           let m = type.preferredMIMEType { return m }
++        return "text/plain; charset=utf-8"
++    }
++
++    func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {
++        stopped.insert(ObjectIdentifier(task))
++    }
++
++    private func fail(_ task: any WKURLSchemeTask, _ status: Int, _ message: String) {
++        respond(task, task.request.url ?? URL(string: "dockview://error")!, status,
++                "text/plain; charset=utf-8", Data(message.utf8))
++    }
++
++    private func respond(_ task: any WKURLSchemeTask, _ url: URL, _ status: Int, _ mime: String, _ data: Data) {
++        guard stopped.remove(ObjectIdentifier(task)) == nil else { return }
++        let headers = ["Content-Type": mime, "Content-Length": "\(data.count)", "Cache-Control": "no-store"]
++        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
++                                             headerFields: headers) else { return }
++        task.didReceive(response)
++        task.didReceive(data)
++        task.didFinish()
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockViewerView.swift b/macos/Sources/Features/Dock/DockViewerView.swift
+new file mode 100644
+index 0000000..d5e7c01
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockViewerView.swift
+@@ -0,0 +1,117 @@
++import SwiftUI
++import WebKit
++
++/// The file viewer's place beside the terminal, left of the browser.
++/// Hidden, it keeps its files, at no width.
++struct DockViewerSlot: View {
++    let owner: AnyObject
++    @ObservedObject var model: DockViewerModel
++    @AppStorage(DockViewer.widthKey) private var savedWidth: Double = 520
++    /// The width while the handle is dragged, saved when it is let go.
++    @State private var dragWidth: Double?
++
++    private var width: Double { dragWidth ?? savedWidth }
++    private var shown: Bool { model.open && !model.files.isEmpty }
++
++    init(owner: AnyObject) {
++        self.owner = owner
++        self.model = DockViewer.model(for: owner)
++    }
++
++    var body: some View {
++        HStack(spacing: 0) {
++            if shown {
++                DockBrowserHandle(width: width,
++                                  onDrag: { dragWidth = $0 },
++                                  onEnd: { if let w = dragWidth { savedWidth = w }; dragWidth = nil })
++                    .frame(width: 7)
++                VStack(spacing: 0) {
++                    DockViewerTabStrip(model: model)
++                    DockViewerBar(model: model)
++                    DockViewerHost(page: model.selected?.view)
++                }
++            }
++        }
++        .frame(width: shown ? width : 0)
++        .clipped()
++        .onDisappear { DockViewer.forget(owner) }
++    }
++}
++
++private struct DockViewerTabStrip: View {
++    @ObservedObject var model: DockViewerModel
++
++    var body: some View {
++        ScrollView(.horizontal, showsIndicators: false) {
++            HStack(spacing: 2) {
++                ForEach(model.files) { file in
++                    HStack(spacing: 4) {
++                        Text(file.label)
++                            .lineLimit(1)
++                            .truncationMode(.middle)
++                            .frame(maxWidth: 180, alignment: .leading)
++                        Button { model.close(file) } label: {
++                            Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
++                        }
++                        .buttonStyle(.borderless)
++                        .help("Close this file")
++                    }
++                    .font(.system(size: 11))
++                    .padding(.horizontal, 8)
++                    .padding(.vertical, 4)
++                    .background(RoundedRectangle(cornerRadius: 5)
++                        .fill(file === model.selected ? Color.primary.opacity(0.12) : Color.clear))
++                    .contentShape(Rectangle())
++                    .onTapGesture { model.select(file) }
++                    .help(file.url.path)
++                }
++            }
++        }
++        .padding(.horizontal, 8)
++        .padding(.top, 6)
++    }
++}
++
++private struct DockViewerBar: View {
++    @ObservedObject var model: DockViewerModel
++
++    var body: some View {
++        HStack(spacing: 6) {
++            Text(model.selected.map { ($0.url.path as NSString).abbreviatingWithTildeInPath } ?? "")
++                .font(.system(size: 11))
++                .foregroundStyle(.secondary)
++                .lineLimit(1)
++                .truncationMode(.head)
++                .textSelection(.enabled)
++            Spacer(minLength: 4)
++            Button { model.selected?.reload() } label: { Image(systemName: "arrow.clockwise") }
++                .help("Reload")
++            Button(action: model.revealInFinder) { Image(systemName: "folder") }
++                .help("Show in Finder")
++            Button(action: model.openElsewhere) { Image(systemName: "arrow.up.forward.app") }
++                .help("Open in its usual app")
++            Button(action: model.close) { Image(systemName: "xmark") }
++                .help("Close the viewer and its files (⌘⇧E only hides it)")
++        }
++        .buttonStyle(.borderless)
++        .padding(.horizontal, 8)
++        .padding(.vertical, 6)
++    }
++}
++
++/// Shows the front file's page.
++private struct DockViewerHost: NSViewRepresentable {
++    let page: WKWebView?
++
++    func makeNSView(context: Context) -> NSView { NSView() }
++
++    func updateNSView(_ box: NSView, context: Context) {
++        for view in box.subviews where view !== page { view.removeFromSuperview() }
++        guard let page else { return }
++        if page.superview !== box {
++            page.frame = box.bounds
++            page.autoresizingMask = [.width, .height]
++            box.addSubview(page)
++        }
++    }
++}
+diff --git a/macos/Sources/Features/Dock/DockWindowClose.swift b/macos/Sources/Features/Dock/DockWindowClose.swift
+new file mode 100644
+index 0000000..5fba076
+--- /dev/null
++++ b/macos/Sources/Features/Dock/DockWindowClose.swift
+@@ -0,0 +1,82 @@
++import AppKit
++
++/// Ghostty Dock: closing a window of several tabs asks first. Keep Running
++/// lets go of each terminal's holder (hold/letgo/<surface>), so its session
++/// goes on, and opens it again as a tab in another window, or in the next
++/// window when none is left. End Sessions closes them as Ghostty would.
++/// Closing a single tab still ends its session, and so does closing the
++/// last terminal window: that is shutting Ghostty down, so it closes as
++/// Ghostty would, with no Keep Running.
++enum DockWindowClose {
++    /// Terminals let go with no window to put them in yet.
++    private(set) static var pending = false
++
++    private static var letGoDir: URL { DockHold.holdDir.appendingPathComponent("letgo") }
++
++    private static var restarter: String {
++        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/ghostty-dock-restart").path
++    }
++
++    /// Asks what to do with the window's tabs, then closes it unless
++    /// cancelled. False when the dock has no say (one tab, no holders, or
++    /// no other terminal window), and the caller closes the window its
++    /// usual way.
++    static func ask(_ windows: [NSWindow], sheetOn window: NSWindow, close: @escaping () -> Void) -> Bool {
++        guard windows.count > 1, DockSettings.holdSessions,
++              FileManager.default.isExecutableFile(atPath: DockHold.binary) else { return false }
++        let others = NSApp.windows.contains {
++            $0.isVisible && $0.windowController is TerminalController && !windows.contains($0)
++        }
++        guard others else { return false }
++        let surfaces = windows.compactMap { $0.windowController as? TerminalController }
++            .flatMap { Array($0.surfaceTree) }
++        guard !surfaces.isEmpty else { return false }
++        let alert = NSAlert()
++        alert.messageText = "Close \(windows.count) Tabs?"
++        alert.informativeText = "Keep Running moves them to another window, "
++            + "with what runs in them still running. End Sessions stops them all."
++        alert.addButton(withTitle: "Keep Running")
++        alert.addButton(withTitle: "End Sessions")
++        alert.addButton(withTitle: "Cancel")
++        alert.beginSheetModal(for: window) { response in
++            switch response {
++            case .alertFirstButtonReturn:
++                letGo(surfaces.map { $0.id.uuidString })
++                close()
++                pending = true
++                // The terminals tell their holders as they close.
++                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { reattachIfWindow() }
++            case .alertSecondButtonReturn:
++                close()
++            default:
++                break
++            }
++        }
++        return true
++    }
++
++    /// Opens the let-go terminals as tabs once a terminal window is up.
++    static func reattachIfWindow() {
++        guard pending, NSApp.windows.contains(where: { $0.isVisible && $0.windowController is TerminalController })
++        else { return }
++        pending = false
++        let restarter = restarter
++        guard FileManager.default.isExecutableFile(atPath: restarter) else {
++            DockLog.restart.error("ghostty-dock-restart is not installed: the kept tabs were not reopened")
++            return
++        }
++        DispatchQueue.global(qos: .userInitiated).async {
++            _ = DockProcess.run("/bin/bash", [restarter, "--reattach"], timeout: 120, log: DockLog.restart)
++        }
++    }
++
++    private static func letGo(_ surfaces: [String]) {
++        let fm = FileManager.default
++        try? fm.createDirectory(at: letGoDir, withIntermediateDirectories: true)
++        // A marker left by a terminal that never closed is stale.
++        for old in (try? fm.contentsOfDirectory(at: letGoDir, includingPropertiesForKeys: nil)) ?? [] {
++            try? fm.removeItem(at: old)
++        }
++        for s in surfaces { fm.createFile(atPath: letGoDir.appendingPathComponent(s).path, contents: nil) }
++    }
++}
 diff --git a/macos/Sources/Features/Dock/DockWorkspace.swift b/macos/Sources/Features/Dock/DockWorkspace.swift
 new file mode 100644
-index 0000000..9be71a4
+index 0000000..f46bdf4
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockWorkspace.swift
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,187 @@
 +import Foundation
 +
 +/// What each row's folder is up to: its git branch, commits not pushed,
@@ -11201,6 +13743,19 @@ index 0000000..9be71a4
 +        return out
 +    }
 +
++    /// `roots` and every process under them.
++    static func descendants(of roots: Set<Int32>, parents: [Int32: Int32]) -> [Int32] {
++        var kids: [Int32: [Int32]] = [:]
++        for (pid, parent) in parents { kids[parent, default: []].append(pid) }
++        var out = Set<Int32>()
++        var queue = Array(roots)
++        while let p = queue.popLast() {
++            guard out.insert(p).inserted else { continue }
++            queue += kids[p] ?? []
++        }
++        return out.sorted()
++    }
++
 +    /// Ports listened on by `root` or anything it started.
 +    static func ports(under root: Int32, listening: [Int32: [Int]], parents: [Int32: Int32]) -> [Int] {
 +        var found = Set<Int>()
@@ -11244,10 +13799,16 @@ index 0000000..9be71a4
 +
 +    /// `folders` maps a row's key to its folder and its claude pid.
 +    func gather(_ folders: [String: (dir: String, pid: Int32?)]) -> [String: DockWorkspace] {
-+        let listening = DockWorkspace.run("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])
-+            .map { DockWorkspace.parseListening(String(decoding: $0, as: UTF8.self)) } ?? [:]
-+        let parents = listening.isEmpty ? [:] : DockWorkspace.run("ps", ["-axo", "pid=,ppid="])
++        // lsof over every process costs about 0.3 s of CPU; asked about only
++        // the sessions' own processes it is about 0.02 s.
++        let roots = Set(folders.values.compactMap(\.pid))
++        let parents = roots.isEmpty ? [:] : DockWorkspace.run("ps", ["-axo", "pid=,ppid="])
 +            .map { DockWorkspace.parseParents(String(decoding: $0, as: UTF8.self)) } ?? [:]
++        let mine = DockWorkspace.descendants(of: roots, parents: parents)
++        let listening = mine.isEmpty ? [:]
++            : DockWorkspace.run("lsof", ["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fpn",
++                                         "-p", mine.map(String.init).joined(separator: ",")])
++                .map { DockWorkspace.parseListening(String(decoding: $0, as: UTF8.self)) } ?? [:]
 +        var out: [String: DockWorkspace] = [:]
 +        var byDir: [String: DockWorkspace] = [:]
 +        for (key, f) in folders where !f.dir.isEmpty {
@@ -11276,6 +13837,91 @@ index 0000000..9be71a4
 +        return pr
 +    }
 +}
+diff --git a/macos/Sources/Features/Terminal/BaseTerminalController.swift b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+index d4b0ac0..4ec0c1d 100644
+--- a/macos/Sources/Features/Terminal/BaseTerminalController.swift
++++ b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+@@ -837,10 +837,27 @@ class BaseTerminalController: NSWindowController,
+ 
+     private func titleDidChange(to: String) {
+         lastComputedTitle = to
++        // Dock: Claude Code animates its title several times a second, and
++        // each new title lays out the title bar. A tab behind another takes
++        // its newest title at most once a second, and as it comes to the front.
++        if let window, (window.tabGroup?.selectedWindow ?? window) !== window {
++            guard !titlePending else { return }
++            titlePending = true
++            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
++                guard let self, self.titlePending else { return }
++                self.titlePending = false
++                self.applyTitleToWindow()
++            }
++            return
++        }
+         applyTitleToWindow()
+     }
+ 
++    /// A title is waiting to be shown on a tab behind another.
++    private var titlePending = false
++
+     private func applyTitleToWindow() {
++        titlePending = false
+         guard let window else { return }
+ 
+         if let titleOverride {
+@@ -1230,6 +1247,7 @@ class BaseTerminalController: NSWindowController,
+     }
+ 
+     func windowDidBecomeKey(_ notification: Notification) {
++        if titlePending { applyTitleToWindow() }
+         // If when we become key our first responder is the window itself, then we
+         // want to move focus to our focused terminal surface. This works around
+         // various weirdness with moving surfaces around.
+diff --git a/macos/Sources/Features/Terminal/TerminalController.swift b/macos/Sources/Features/Terminal/TerminalController.swift
+index 56b0b40..06f4e0a 100644
+--- a/macos/Sources/Features/Terminal/TerminalController.swift
++++ b/macos/Sources/Features/Terminal/TerminalController.swift
+@@ -1132,7 +1132,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+             case .tab: closeTab(nil)
+             case .window:
+                 guard self.window?.isFirstWindowInTabGroup ?? false else { return }
+-                closeWindow(nil)
++                closeWindowAskingDock()
+             }
+         }
+ 
+@@ -1316,8 +1316,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+         defaultSize.apply(to: window)
+     }
+ 
++    /// Ghostty Dock: a window of several tabs asks whether to keep their
++    /// sessions running (DockWindowClose); closing its last tab does not.
++    private func closeWindowAskingDock() {
++        guard let window else { return }
++        if DockWindowClose.ask(window.tabGroup?.windows ?? [window], sheetOn: window,
++                               close: { [weak self] in self?.closeWindowImmediately() }) { return }
++        closeWindow(nil)
++    }
++
+     @IBAction override func closeWindow(_ sender: Any?) {
+         guard let window = window else { return }
++        // The menu's Close Window: the whole window, not its last tab.
++        if sender is NSMenuItem {
++            closeWindowAskingDock()
++            return
++        }
+ 
+         // We need to check all the windows in our tab group for confirmation
+         // if we're closing the window. If we don't have a tabgroup for any
+@@ -1521,7 +1535,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+     @objc private func onCloseWindow(notification: SwiftUI.Notification) {
+         guard let target = notification.object as? Ghostty.SurfaceView else { return }
+         guard surfaceTree.contains(target) else { return }
+-        closeWindow(self)
++        closeWindowAskingDock()
+     }
+ 
+     @objc private func onResetWindowSize(notification: SwiftUI.Notification) {
 diff --git a/macos/Sources/Features/Terminal/TerminalRestorable.swift b/macos/Sources/Features/Terminal/TerminalRestorable.swift
 index aab51f6..b96bbf4 100644
 --- a/macos/Sources/Features/Terminal/TerminalRestorable.swift
@@ -11292,7 +13938,7 @@ index aab51f6..b96bbf4 100644
              return
          }
 diff --git a/macos/Sources/Features/Terminal/TerminalView.swift b/macos/Sources/Features/Terminal/TerminalView.swift
-index b6e1c63..1d20e4d 100644
+index b6e1c63..0798eeb 100644
 --- a/macos/Sources/Features/Terminal/TerminalView.swift
 +++ b/macos/Sources/Features/Terminal/TerminalView.swift
 @@ -79,6 +79,10 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
@@ -11306,15 +13952,17 @@ index b6e1c63..1d20e4d 100644
                      TerminalSplitTreeView(
                          tree: viewModel.surfaceTree,
                          action: { delegate?.performSplitAction($0) })
-@@ -103,6 +107,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
+@@ -103,6 +107,9 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                          }
                          .frame(idealWidth: lastFocusedSurface?.value?.initialSize?.width,
                                 idealHeight: lastFocusedSurface?.value?.initialSize?.height)
++                    DockViewerSlot(owner: viewModel)
++                    DockBrowserSlot(owner: viewModel)
 +                    }
                  }
                  // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
                  .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
-@@ -117,6 +122,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
+@@ -117,6 +124,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                      }
                  }
  
@@ -11324,10 +13972,22 @@ index b6e1c63..1d20e4d 100644
                  if viewModel.updateOverlayIsVisible {
                      UpdateOverlay()
 diff --git a/macos/Sources/Features/Terminal/Window Styles/TerminalWindow.swift b/macos/Sources/Features/Terminal/Window Styles/TerminalWindow.swift
-index e19d671..fbe4025 100644
+index e19d671..ea8d897 100644
 --- a/macos/Sources/Features/Terminal/Window Styles/TerminalWindow.swift	
 +++ b/macos/Sources/Features/Terminal/Window Styles/TerminalWindow.swift	
-@@ -196,12 +196,14 @@ class TerminalWindow: NSWindow {
+@@ -180,6 +180,11 @@ class TerminalWindow: NSWindow {
+     override var canBecomeMain: Bool { return true }
+ 
+     override func sendEvent(_ event: NSEvent) {
++        // Ghostty Dock: before the tab title editor, which would take a
++        // double-click on a tab as a rename (⌥-double-click still is).
++        if DockTitlebarDoubleClick.handle(event, in: self) {
++            return
++        }
+         if tabTitleEditor.handleMouseDown(event) {
+             return
+         }
+@@ -196,12 +201,14 @@ class TerminalWindow: NSWindow {
      override func becomeKey() {
          super.becomeKey()
          resetZoomTabButton.contentTintColor = .controlAccentColor
@@ -11342,7 +14002,7 @@ index e19d671..fbe4025 100644
      }
  
      override func becomeMain() {
-@@ -255,6 +257,8 @@ class TerminalWindow: NSWindow {
+@@ -255,6 +262,8 @@ class TerminalWindow: NSWindow {
          // it. This has been verified to work on macOS 12 to 26
          if isTabBar(childViewController) {
              childViewController.identifier = Self.tabBarIdentifier
@@ -11351,7 +14011,7 @@ index e19d671..fbe4025 100644
              tabBarDidAppear()
          }
      }
-@@ -398,6 +402,7 @@ class TerminalWindow: NSWindow {
+@@ -398,6 +407,7 @@ class TerminalWindow: NSWindow {
              /// Check ``titlebarFont`` down below
              /// to see why we need to check `hasMoreThanOneTabs` here
              titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
@@ -11360,7 +14020,7 @@ index e19d671..fbe4025 100644
      }
  
 diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
-index 2f0644b..1807a0c 100644
+index 2f0644b..000bcdb 100644
 --- a/macos/Sources/Ghostty/Ghostty.App.swift
 +++ b/macos/Sources/Ghostty/Ghostty.App.swift
 @@ -549,7 +549,12 @@ extension Ghostty {
@@ -11376,6 +14036,41 @@ index 2f0644b..1807a0c 100644
  
              case GHOSTTY_ACTION_FLOAT_WINDOW:
                  toggleFloatWindow(app, target: target, mode: action.action.float_window)
+@@ -621,7 +626,7 @@ extension Ghostty {
+                 checkForUpdates(app)
+ 
+             case GHOSTTY_ACTION_OPEN_URL:
+-                return openURL(action.action.open_url)
++                return openURL(action.action.open_url, target: target)
+ 
+             case GHOSTTY_ACTION_UNDO:
+                 return undo(app, target: target)
+@@ -700,7 +705,8 @@ extension Ghostty {
+         }
+ 
+         private static func openURL(
+-            _ v: ghostty_action_open_url_s
++            _ v: ghostty_action_open_url_s,
++            target: ghostty_target_s? = nil
+         ) -> Bool {
+             let action = Ghostty.Action.OpenURL(c: v)
+ 
+@@ -718,6 +724,15 @@ extension Ghostty {
+                 url = URL(filePath: expandedPath)
+             }
+ 
++            // Ghostty Dock: a file the viewer shows, or a web page, opens beside the terminal.
++            if let target, target.tag == GHOSTTY_TARGET_SURFACE, let surface = target.target.surface,
++               MainActor.assumeIsolated({
++                   let view = surfaceView(from: surface)
++                   return DockBrowser.open(url, from: view) || DockViewer.open(url, from: view)
++               }) {
++                return true
++            }
++
+             switch action.kind {
+             case .text:
+                 // Open with the default editor for `*.ghostty` file or just system text editor
 diff --git a/macos/Sources/Ghostty/Ghostty.Config.swift b/macos/Sources/Ghostty/Ghostty.Config.swift
 index 160894b..0853534 100644
 --- a/macos/Sources/Ghostty/Ghostty.Config.swift
@@ -11393,7 +14088,7 @@ index 160894b..0853534 100644
  
              // TODO: we'd probably do some config loading here... for now we'd
 diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView.swift b/macos/Sources/Ghostty/Surface View/SurfaceView.swift
-index 47503dc..efb5f22 100644
+index 47503dc..3070afa 100644
 --- a/macos/Sources/Ghostty/Surface View/SurfaceView.swift	
 +++ b/macos/Sources/Ghostty/Surface View/SurfaceView.swift	
 @@ -218,7 +218,11 @@ extension Ghostty {
@@ -11408,7 +14103,7 @@ index 47503dc..efb5f22 100644
                  }
  
                  // If we're part of a split view and don't have focus, we put a semi-transparent
-@@ -724,12 +728,23 @@ extension Ghostty {
+@@ -724,12 +728,25 @@ extension Ghostty {
              return try workingDirectory.withCString { cWorkingDir in
                  config.working_directory = cWorkingDir
  
@@ -11427,6 +14122,8 @@ index 47503dc..efb5f22 100644
 +                        var environmentVariables = environmentVariables
 +#if os(macOS)
 +                        environmentVariables[DockSessions.surfaceEnv] = view.id.uuidString
++                        // and web links Claude Code opens go to the browser beside it.
++                        if let browse = DockBrowser.browseCommand { environmentVariables["BROWSER"] = browse }
 +#endif
 +
                          // Convert dictionary to arrays for easier processing
@@ -11455,3 +14152,35 @@ index 3129acf..b271610 100644
              let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                  ghostty_surface_new(app, &surface_cfg_c)
              }
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 4d66622..83a671f 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -2678,7 +2678,10 @@ pub fn keyCallback(
+         // 1. mouse reporting is off
+         // OR
+         // 2. mouse reporting is on and we are not reporting shift to the terminal
++        // Ghostty Dock: or ⌘ is held, which no mouse report carries, so a
++        // ⌘-click opens a link in Claude Code too.
+         if (self.io.terminal.flags.mouse_event == .none or
++            self.mouse.mods.super or
+             (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
+         {
+             // Refresh our link state
+@@ -3990,6 +3993,8 @@ pub fn mouseButtonCallback(
+             // If we have shift-pressed and we aren't allowed to capture it,
+             // then we do not do a mouse report.
+             if (mods.shift and !shift_capture) break :report;
++            // Ghostty Dock: nor a ⌘-click on a link, which opens it.
++            if (mods.super and self.mouse.over_link) break :report;
+ 
+             // In any other mouse button scenario without shift pressed we
+             // clear the selection since the underlying application can handle
+@@ -4715,6 +4720,7 @@ pub fn cursorPosCallback(
+         self.mouse.link_point == null or
+         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
+         (self.io.terminal.flags.mouse_event == .none or
++            self.mouse.mods.super or // Ghostty Dock: ⌘, as above
+             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+     {
+         // If we were previously over a link, we always update. We do this so that if the text

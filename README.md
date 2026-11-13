@@ -104,6 +104,11 @@ reports each session's status.
   under the tabs, grey with a dashed outline. Click one to show its window, or
   its **Dock** icon (↙) to restart it in a tab here at once.
   Same as `ghostty-dock-move --pid <pid>`, `--undock <session id>`, `--detach`.
+  A Ghostty window with only shells in it is listed there too, with what its
+  tabs are running (such as a backup script). Its **Dock** icon waits for
+  that to finish (moving a running shell would stop it), then opens a shell
+  tab here in each tab's folder and closes the window. Same as
+  `ghostty-dock-move --shells <pid>`.
 - ⌘⇧J (Ctrl-Opt-J from any app): jump to the next session that needs you (then finished ones).
 - The window title (the session's name) sits in the middle of the title bar.
 - Dock badge: how many sessions need you.
@@ -121,6 +126,8 @@ reports each session's status.
   last 3 months; click one to reopen it. Its search matches names, folders
   and, from three letters, what was said in them, with the line it was said
   in. Open sessions it was said in show under "Open now"; click to go there.
+  ⇅ beside the search flips it to oldest first. A click anywhere else folds
+  it away.
 - **Cost**: each row ends with what the session has cost so far, subagents
   included, priced like the Cost Sidebar below. Off in Settings.
 - **Branch, pull request and ports**: a line under each row like
@@ -169,7 +176,8 @@ reports each session's status.
   catalogue by Callum Baker: four MIT collections (agency-agents, VoltAgent,
   wshobson, 0xfurai), pinned and hash-checked, with risky instructions flagged.
   Search or pick a kind, tick the ones you want and press **Install** (Return):
-  they go to ~/.claude/agents, or one open project's .claude/agents. Each shows
+  they go to the selected session's project (.claude/agents there), or pick
+  ~/.claude/agents for every project, or another open project. Each shows
   what it does, a warning if it can run commands or use every tool, its
   instructions, and how to use it: "Use the code-reviewer agent to …" (Copy),
   or **Start a Session as It** (`claude --agent <name>` in a new tab). Remove
@@ -193,12 +201,18 @@ reports each session's status.
   commits, then one card per repo (sessions in its subfolders and worktrees
   count toward it), most spent first: each session by its first prompt (click
   to go to it, or reopen it if closed), the files Claude edited, and your
-  commits that day on any branch. ‹ › step back through earlier days. Read
-  from the transcripts and git when it opens; nothing is tracked.
+  commits that day on any branch. ‹ › step back through earlier days, and the
+  PDF button saves the day as A4 pages and opens them. Read from the
+  transcripts and git when it opens; nothing is tracked.
 - **Reopen closed (⌘⇧T)**: within a few seconds Ghostty brings the tab back as
   it was; after that, the session is resumed in a new tab with its old flags.
 - **Right-click a row** to rename it, pin it to the top or give it a colour.
   These stick to the session, across restarts.
+- **Child Terminal Here…** (right-click) opens a plain shell in the
+  session's folder, for what you must type yourself (`sudo`, a password). It
+  is listed under the session, with a dotted line, whatever the sort; `exit`
+  closes it. Right-click a child → **Stand on Its Own** to make it a row like
+  any other, for good.
 - **Colour a session** with the 🎨 header button, right-click → Colourise
   (pick straight from the menu) or right-click → Colour…:
   20 colours that sit well together. Its row is tinted in it and its
@@ -228,65 +242,39 @@ reports each session's status.
   started before still use the old account (Remote Control goes quiet).
   The sidebar says how many; **Resume Them…** resumes each in a fresh tab
   with its flags, so `--remote-control` keeps its name.
+- **After a logout or login window crash**, the tabs come back but what runs
+  in them is still in the ended login (no network lookups, Keychain,
+  clipboard or opening apps). Each Claude session there is resumed in the
+  current login, once it has been quiet for a while, with its flags and
+  conversation; checked every minute. Plain shells are left as they are.
+- **Permissions skipped** (Settings, on by default): new, restarted, moved
+  and reopened sessions start with `--dangerously-skip-permissions`, unless
+  given a `--permission-mode`. Saved as `CLAUDE_PANEL_BYPASS_PERMISSIONS` in
+  `~/.config/claude-panel/options`, which `ghostty-claude-launcher` reads too.
+- **Remote Control names** (Settings, off by default): every five minutes,
+  each running session's title on the phone is set to its repo, so the
+  phone's AI titles are undone. The title lives on Anthropic's server, and
+  neither `--remote-control <name>` nor a rename from the Mac changes one the
+  phone already has, so `ghostty-dock-rc-titles` sets it there with the call
+  Claude Code itself makes, using your Claude login from the Keychain. It is
+  an internal API and may change. Sessions are not restarted; the grey line
+  under each title is the phone app's.
+- Markdown is rendered, with tables, task lists and highlighted code blocks.
+- Source and text files show with line numbers and highlighting, and are
+  never run: a ⌘-clicked `.sh` used to offer to run it in Terminal.
+- Images and PDFs show as they are.
+- HTML files, web links and anything else open in their usual app, as before.
 
-## Agents: getting started
+It reloads as the file changes, keeping your place. Each file is a tab; ⌘-click
+an open one to bring it to the front. ⌘⇧E hides and shows it, and the bar has
+reload, Show in Finder, open in its usual app, and × to close it and its
+files. Drag its left edge to resize it.
 
-An agent is a helper with its own instructions that a Claude session can hand
-work to. The Agents window (⌘⇧A, or 👥 at the top of the sidebar) has three
-tabs: **Activity** shows what agents are doing and what they cost, **Set Up**
-shows the agents you have, and **Find Agents** has 647 ready-made ones.
-
-1. **Find one.** Open Agents → **Find Agents**. Type what you need (reviewer,
-   react, security, sql…) or choose a kind from **All kinds**. Click a row to
-   read what the agent does, whether it can run commands, and its full
-   instructions.
-2. **Install it.** Tick the agents you want. Under **Install to**, choose
-   **Every project** (`~/.claude/agents`) or one open project
-   (`<project>/.claude/agents`), then press **Install** (or Return). Installed
-   rows get a green tick.
-3. **Use it.** In any session, ask for it by name, for example *"Use the
-   code-reviewer agent to review my last commit"*. The agent's detail shows
-   that line with a **Copy** button. Or use **Start a Session as It** to
-   open a new tab running `claude --agent <name>`, where the whole session is
-   that agent.
-4. **Watch it.** **Activity** lists each agent as it runs: what it is doing,
-   its model, tool calls, tokens and cost. Click a row to go to its session.
-   While agents run, the 👥 button turns green and shows a count.
-5. **Change it.** In **Set Up**, pick an agent to edit its description (which
-   Claude uses to decide when to call it), model, colour, tools and
-   instructions. **Duplicate as Mine** copies a plugin's agent so you can
-   change it. **+** makes a new one, and **Move to Trash** removes one.
-
-Sessions start in the folder they were opened in, so an agent installed for
-one project is only offered there. Agents for every project are offered
-everywhere. Installed files are as their authors wrote them, so read the
-instructions before you install, especially when the agent is flagged as able
-to run commands.
-
-## Keyboard shortcuts
-
-| Keys | Does |
-|---|---|
-| ⌘1 – ⌘8, ⌘9 | Go to that session in the sidebar, or the last one |
-| ⌃⇥ / ⌃⇧⇥, ⌘⇧] / ⌘⇧[ | Next / previous session, in the sidebar's order |
-| ⌘⇧J (⌃⌥J from any app) | Next session that needs you, then finished ones |
-| ⌘⇧R | Restart this session |
-| ⌘⇧U | Undock this session to its own window |
-| ⌘⇧S | Show or hide the sidebar |
-| ⌘P | Find a session by name, folder or question |
-| ⌘⇧A | Agents across all sessions |
-| ⌘⇧O | Overview: every session on one screen |
-| ⌘⇧Y | Daily recap |
-| ⌘⇧T | Reopen the last closed session |
-
-While the sidebar is hidden, ⌘1–9 and the next/previous keys are Ghostty's
-own again (tab order). Everything else in Ghostty (⌘T, ⌘W, splits) is unchanged.
-
-**In Finder:** right-click a folder → **Quick Actions** → **Launch Claude Code
-in Ghostty** or **Continue last Claude Code session in Ghostty** opens it as a
-tab. `install.sh` adds both if they are missing. Settings → Shortcuts → In
-Finder gives each a key (**Add Shortcut**, **Remove Shortcut**), with a picture
-of the menu.
+⌘-click works in Claude Code too, though it has the mouse: Ghostty Dock
+looks for links whenever ⌘ is held, which no program sees. A name relative to
+the terminal's folder works. `ghostty-dock view <file>` opens one from a
+script, and every Claude Code session in a dock tab is told it can show you a
+file this way.
 
 ## Command line and scripting
 
@@ -301,6 +289,9 @@ ghostty-dock read aws-cli --lines 20              # what is on its screen
 ghostty-dock wait aws-cli 'passed|failed' --timeout 600
 ghostty-dock notify "Deploy done" "prod is on 1.4.2"
 ghostty-dock open ~/code/repo --command claude    # a new tab
+ghostty-dock browser --show                       # start this tab's browser and show it
+ghostty-dock url http://localhost:3000            # open a page in this tab's browser
+ghostty-dock view docs/plan.md                    # show a file in this tab's viewer
 ```
 
 A session is named by its session id, its name in the sidebar, its folder or
@@ -309,10 +300,13 @@ the start of its name. Requests go through files in
 
 ## Themes
 
-Settings → Theme picks one of 20 (Catppuccin Mocha, Macchiato, Frappe and
-Latte; TokyoNight Storm, Night and Day; Dracula; Nord; Gruvbox Dark and Light;
-Rose Pine and Rose Pine Dawn; Kanagawa Wave; Everforest Dark Hard; One Half
-Dark; GitHub Dark and Light; Monokai Pro; Solarized Light). The terminal and
+Settings → Theme picks one of 43, in three groups: **Dark** (Catppuccin,
+TokyoNight, Dracula, Nord, Gruvbox, Rose Pine, Kanagawa, Everforest, One Half,
+GitHub, Monokai Pro, Ayu Mirage, Material Ocean), **Electric** (Synthwave,
+Cyberpunk, Shades Of Purple, Laser, Neon, Electron Highlighter, Cobalt Neon,
+Andromeda, Poimandres, Night Owl, Fairyfloss, Matrix, Red Planet, Hot Dog
+Stand) and **Light** (Catppuccin Latte, GitHub, Rose Pine Dawn, Solarized,
+Gruvbox, TokyoNight Day, Ayu, Flexoki, Everforest). The terminal and
 the sidebar change together, in every window. The default follows the `theme`
 in your Ghostty config. Your Ghostty config is never edited: the choice is
 written to `~/.local/state/ghostty-dock/theme.conf`, which only Ghostty Dock
@@ -413,10 +407,13 @@ type a password if asked.
 ## Tests
 
     bash tests/hook-test.sh                          # the Claude Code hook
+    bash tests/browser-tools-test.sh                 # the browser note, dock-browser tools and $BROWSER
+    bash tests/restart-test.sh                       # split tabs come back split after a restart
+    bash tests/viewer-test.sh                        # the file viewer's page (macOS, after a build)
     swift test --package-path tests/dock-logic       # sidebar order, groups, cost (after a build)
     bash tests/patch-test.sh --latest                # the patch still applies to Ghostty
 
-GitHub Actions runs all three on every push, and the patch check every Monday
+GitHub Actions runs them all on every push, and the patch check every Monday
 against the newest Ghostty release.
 
 ## When sessions don't come back

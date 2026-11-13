@@ -20,6 +20,8 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <spawn.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +150,17 @@ static int app_quitting(pid_t app) {
     if (!fgets(buf, sizeof buf, f)) buf[0] = 0;
     fclose(f);
     return atoi(buf) == app;
+}
+
+// The app writes hold/letgo/<surface> for each terminal of a window it is
+// closing with its sessions kept: that terminal lets go of its holder, the
+// holder keeps running, and the app reattaches it in another window.
+static int let_go(void) {
+    const char *surface = getenv("GHOSTTY_DOCK_SURFACE");
+    if (!surface || !*surface || strchr(surface, '/')) return 0;
+    char path[700];
+    snprintf(path, sizeof path, "%s/letgo/%s", hold_dir, surface);
+    return unlink(path) == 0;
 }
 
 // ---- master ----------------------------------------------------------------
@@ -288,6 +301,16 @@ static int is_shell(pid_t pid) {
     return 0;
 }
 
+// Whether the foreground group is just a shell at its prompt. A script that
+// launches a program (a wrapper around claude) keeps it in its own group.
+static int shell_only(pid_t pgrp) {
+    pid_t pids[256];
+    int n = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgrp, pids, sizeof pids) / (int)sizeof *pids;
+    if (n <= 0) return is_shell(pgrp);
+    for (int i = 0; i < n; i++) if (pids[i] > 0 && !is_shell(pids[i])) return 0;
+    return 1;
+}
+
 static void replay(int fd, int pty, struct winsize ws) {
     size_t n;
     char *buf = kept(&n);
@@ -313,7 +336,7 @@ static void replay(int fd, int pty, struct winsize ws) {
 
     // A program redraws on a size change; a shell would only print its prompt again.
     pid_t fg = tcgetpgrp(pty);
-    if (fg > 0 && !is_shell(fg) && ws.ws_col > 2) {
+    if (fg > 0 && !shell_only(fg) && ws.ws_col > 2) {
         struct winsize nudge = ws;
         nudge.ws_col--;
         ioctl(pty, TIOCSWINSZ, &nudge);
@@ -592,7 +615,7 @@ static int client(const char *name) {
         }
     }
     // The terminal went away: the tab was closed, or the app is going.
-    send_pkt(fd, !alive(app) || app_quitting(app) ? PKT_DETACH : PKT_CLOSE, NULL, 0);
+    send_pkt(fd, !alive(app) || app_quitting(app) || let_go() ? PKT_DETACH : PKT_CLOSE, NULL, 0);
     close(fd);
     return 0;
 }
@@ -712,6 +735,27 @@ static int cmd_list(int detached_only, int kill_them) {
     return 0;
 }
 
+// macOS asks the app that started a process before letting it into the
+// Desktop, Documents and the like. A tab's holder outlives the app that
+// started it, so it answers for itself instead: it is signed as the app,
+// and its shell gets the app's permissions before and after a restart.
+extern int responsibility_get_pid_responsible_for_pid(pid_t);
+extern int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *, bool);
+extern char **environ;
+
+static void disclaim(char **argv) {
+    if (responsibility_get_pid_responsible_for_pid(getpid()) == getpid()) return;
+    char self[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(getpid(), self, sizeof self) <= 0) return;
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) return;
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC);
+    responsibility_spawnattrs_setdisclaim(&attr, true);
+    posix_spawn(NULL, self, NULL, &attr, argv, environ);
+    // Only returns if it could not: run on as the app's.
+    posix_spawnattr_destroy(&attr);
+}
+
 static void usage(void) {
     fputs("usage: ghostty-dock-hold new [--login] -- <command> [args...]\n"
           "       ghostty-dock-hold attach <name>\n"
@@ -731,6 +775,7 @@ int main(int argc, char **argv) {
         for (; i < argc && strcmp(argv[i], "--") != 0; i++)
             if (strcmp(argv[i], "--login") == 0) login = 1;
         if (i + 1 >= argc) usage();
+        disclaim(argv);
         unsetenv("GHOSTTY_DOCK_HOLD");
         return cmd_new(login, argv + i + 1);
     }

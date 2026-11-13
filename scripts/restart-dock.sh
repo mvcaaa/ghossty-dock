@@ -20,6 +20,10 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 STATE_DIR="$HOME/.local/state/ghostty-dock"
 LOG="$STATE_DIR/restart-dock.log"
 SAVED="$STATE_DIR/open-sessions.tsv"
+# Which app instance wrote $SAVED ("<pid> <start time>"). A list some other
+# instance wrote - copied over from another Mac, or left by an app that ran
+# before it arrived - is restored, never written over by --save.
+SAVED_BY="$STATE_DIR/open-sessions.owner"
 DESCRIBED="$STATE_DIR/described"
 # Sessions a restart or restore could not bring back: the app offers to
 # reopen them (--reopen-missing) until they run again.
@@ -29,6 +33,10 @@ STATUS="$STATE_DIR/restart-status"
 # The sessions a restart is bringing back, while it runs: --save and
 # --restore leave them alone, and the app's Loading screen counts them.
 RESTARTING="$STATE_DIR/restarting.tsv"
+# The splits of each tab, which the app records (DockLayout.swift), and the
+# copy a restart takes before the app quits.
+LAYOUT="$STATE_DIR/layout.json"
+LAYOUT_KEPT="$STATE_DIR/layout-restart.json"
 OPENER="$HOME/.local/bin/ghostty-dock-open"
 APP_BIN="$HOME/Applications/Ghostty Dock.app/Contents/MacOS/ghostty"
 HOLD="${GHOSTTY_DOCK_HOLD_BIN:-$HOME/Applications/Ghostty Dock.app/Contents/MacOS/ghostty-dock-hold}"
@@ -52,6 +60,8 @@ options:
     --save         Record the open sessions (for --restore) and stop
     --restore      Reopen the sessions recorded by --save that are not
                    running anywhere, then stop
+    --reattach     Open a tab for each terminal left running without
+                   one (a window closed with its sessions kept), then stop
     --reopen-missing
                    Reopen the sessions a restart or restore could not
                    bring back (listed in missing-sessions.tsv), then stop
@@ -146,6 +156,22 @@ print(shlex.join(out))
 PY
 }
 
+# Flags with --dangerously-skip-permissions added, as every new session is
+# started (ghostty-claude-launcher), unless CLAUDE_PANEL_BYPASS_PERMISSIONS is
+# off in ~/.config/claude-panel/options or the flags already pick a mode. A
+# session started some other way otherwise came back asking, or in auto mode.
+function with_bypass() {
+    local flags="$1" opt
+    opt=$(grep -E '^CLAUDE_PANEL_BYPASS_PERMISSIONS=' "$HOME/.config/claude-panel/options" 2>/dev/null | tail -1)
+    opt=$(printf '%s' "${opt#*=}" | tr -d "\"' " | tr '[:upper:]' '[:lower:]')
+    case "$opt" in false|0|no|off) echo "$flags"; return ;; esac
+    if grep -qE -- '(^| )(--dangerously-skip-permissions|--permission-mode)( |=|$)' <<<"$flags"; then
+        echo "$flags"
+    else
+        echo "--dangerously-skip-permissions${flags:+ $flags}"
+    fi
+}
+
 # Prints "<cwd>\t<session id>\t<flags>" for a claude pid; the session id is
 # empty when it cannot be told, and that claude is not resumed. Prints
 # nothing without a folder (a claude that is exiting): read splits on tabs
@@ -174,7 +200,7 @@ function describe() {
         [ -d "$cwd" ] && mkdir -p "$DESCRIBED" && printf '%s\n%s\t%s' "$args" "$cwd" "$flags" >"$cache"
     fi
     [ -d "$cwd" ] || return 0
-    printf '%s\t%s\t%s\n' "$cwd" "$sid" "$flags"
+    printf '%s\t%s\t%s\n' "$cwd" "$sid" "$(with_bypass "$flags")"
 }
 
 # True when the transcript's last turn is over: its last entry is the
@@ -278,20 +304,81 @@ function restarting() {
     [ -n "$(find "$RESTARTING" -mmin -10 2>/dev/null)" ]
 }
 
+# A claude in a terminal whose SessionStart hook never recorded it (it timed
+# out: after a power cut every session starts at once and the Mac is busy)
+# shows as a plain shell until its next prompt. This records it as that hook
+# would have, from the claude's own environment, once it has run for 30 s.
+function backfill_status() {
+    local hook="$HOME/.local/bin/ghostty-dock-hook" sessions="$STATE_DIR/sessions"
+    [ -x "$hook" ] || return 0
+    local recorded line cpid tty etime sid env cwd var
+    recorded=$(cat "$sessions"/*.json 2>/dev/null | grep -o '"session_id":"[^"]*"')
+    while read -r cpid tty etime line; do
+        [ -n "$cpid" ] && [ "$tty" != "??" ] || continue
+        sid=$(sed -nE 's/^claude .*--(session-id|resume) ([0-9a-f-]{36})( .*)?$/\2/p' <<<"$line")
+        [ -n "$sid" ] || continue
+        grep -qF "\"session_id\":\"$sid\"" <<<"$recorded" && continue
+        # etime is [[dd-]hh:]mm:ss: under 30 s, its own hook may still come.
+        [[ "$etime" =~ ^00:([0-2][0-9])$ ]] && continue
+        env=$(ps -E -ww -o command= -p "$cpid" 2>/dev/null | tr ' ' '\n')
+        cwd=$(lsof -a -p "$cpid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+        [ -d "$cwd" ] || continue
+        local vars=()
+        for var in GHOSTTY_DOCK_HOLD GHOSTTY_DOCK_SURFACE DOCK_TAB_ID; do
+            vars+=("$(grep -m1 "^$var=" <<<"$env" || echo "$var=")")
+        done
+        jq -nc --arg sid "$sid" --arg cwd "$cwd" \
+            '{hook_event_name: "SessionStart", source: "resume", session_id: $sid, cwd: $cwd}' |
+            env "${vars[@]}" GHOSTTY_DOCK_TEST_LINEAGE="$cpid - $tty" "$hook" >/dev/null 2>&1
+        log "recorded $(basename "$cwd"): its SessionStart hook did not ($sid)"
+    done < <(ps -axo pid=,tty=,etime=,comm=,args= | awk '$4 == "claude" { $4 = ""; print }' | sed -E 's/  +/ /')
+    return 0
+}
+
 function save() {
     restarting && return 0
     local pid
     pid=$(app_pid)
     [ -z "$pid" ] && return 0
+    local me
+    me="$pid $(ps -o lstart= -p "$pid" 2>/dev/null)"
+    # Moving to a new Mac: the app there ran before the old one's state was
+    # copied in, so its first --save wrote over the copied list and the
+    # sessions were never reopened. A list this app did not write is
+    # restored first.
+    if [ -s "$SAVED" ] && [ "$(cat "$SAVED_BY" 2>/dev/null)" != "$me" ]; then
+        if restore_enabled; then
+            restore_foreign
+        else
+            rm -f "$SAVED"
+        fi
+    fi
     # Held sessions too: a reboot ends their holders, and then they are
     # resumed like the rest.
-    open_sessions "$pid" $(holder_pids) >"$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
+    open_sessions "$pid" $(holder_pids) >"$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED" &&
+        echo "$me" >"$SAVED_BY"
+    backfill_status
     # Forgets processes that have ended.
     local f
     for f in "$DESCRIBED"/*; do
         [ -f "$f" ] && ! kill -0 "${f##*/}" 2>/dev/null && rm -f "$f"
     done
     return 0
+}
+
+# The app's "Reopen sessions after a quit" setting (on unless turned off).
+function restore_enabled() {
+    [ "$(defaults read consulting.cloudscale.ghosttydock dock.restoreSessions 2>/dev/null)" != 0 ]
+}
+
+# Reopens a saved list some other app instance wrote, as --restore would,
+# but without reattaching held tabs: this app is already running them.
+function restore_foreign() {
+    local sessions
+    sessions=$(cat "$SAVED")
+    rm -f "$SAVED"
+    log "restore: sessions saved by another app instance (copied from another Mac?): $(conditions)"
+    reopen_all "$sessions" "$(open_sessions $(holder_pids) | cut -f2)"
 }
 
 # Only a session in a terminal counts: Claude Burst's handover writer runs
@@ -305,27 +392,120 @@ function running_anywhere() {
 
 function restore() {
     restarting && { log "restore: skipped, a restart is reopening the sessions"; return 0; }
-    reattach_all
-    [ -s "$SAVED" ] || return 0
+    local held
+    held=$(held_items)
+    [ -n "$held" ] && log "reattaching $(grep -c . <<<"$held") terminal(s)"
+    if [ ! -s "$SAVED" ]; then
+        open_items "$LAYOUT" <<<"$held"
+        return 0
+    fi
     local sessions
     sessions=$(cat "$SAVED")
     rm -f "$SAVED"
     log "restore: $(conditions)"
-    reopen_all "$sessions" "$(open_sessions $(holder_pids) | cut -f2)"
+    reopen_all "$sessions" "$(open_sessions $(holder_pids) | cut -f2)" "$held"
 }
 
-# Opens a tab on every holder left without one, so what ran in the tabs
-# before a quit, crash or restart is back with its output.
-function reattach_all() {
-    local name hpid attached cwd rest n=0
+# Opens a tab for each terminal left running without one, as when a window
+# is closed with its sessions kept; nothing else is reopened.
+function reattach() {
+    restarting && { log "reattach: skipped, a restart is reopening the sessions"; return 0; }
+    local held
+    held=$(held_items)
+    [ -z "$held" ] && return 0
+    log "reattaching $(grep -c . <<<"$held") terminal(s) from a closed window"
+    open_items "$LAYOUT" <<<"$held"
+}
+
+# Prints "<surface>\t<folder>\t<command>" reattaching every holder left
+# without a tab, so what ran in the tabs before a quit, crash or restart
+# is back with its output. <surface> is the terminal it was in, or "-".
+function held_items() {
+    local name hpid attached cwd rest surface
     while IFS=$'\t' read -r name hpid attached cwd rest; do
         [ -n "$name" ] && [ "$attached" = 0 ] || continue
         [ -d "$cwd" ] || cwd="$HOME"
-        "$OPENER" --command "'$HOLD' attach $name" "$cwd" >>"$LOG" 2>&1 \
-            || log "$(basename "$cwd"): reattaching failed"
-        n=$((n + 1))
+        surface=$(cat "$STATE_DIR/hold/$name.surface" 2>/dev/null)
+        printf '%s\t%s\t%s\n' "${surface:--}" "$cwd" "'$HOLD' attach $name"
     done < <(holders --detached)
-    [ "$n" -gt 0 ] && log "reattached $n tab(s)"
+}
+
+# The terminal a session was last in, from the hook's state.
+function session_surface() {
+    local files file
+    files=$(grep -l "\"session_id\":\"$1\"" "$STATE_DIR"/sessions/srf-*.json 2>/dev/null)
+    # Not through xargs: GNU xargs runs ls with no files, listing the folder.
+    [ -n "$files" ] || return 0
+    file=$(ls -t $files | head -1)
+    file="${file##*/srf-}"
+    echo "${file%.json}"
+}
+
+# Prints "<surface>\t<folder>\t<command>" resuming each session not
+# already running.
+function session_items() {
+    local cwd sid flags surface
+    while IFS=$'\t' read -r cwd sid flags; do
+        [ -z "$sid" ] && continue
+        # Once only: never a second tab on a session already back.
+        running_anywhere "$sid" && continue
+        surface=$(session_surface "$sid")
+        printf '%s\t%s\t%s\n' "${surface:--}" "$cwd" "caffeinate -i claude --resume $sid $flags"
+    done <<<"$1"
+}
+
+# What to open, in order, to put the given terminals back as they were
+# split: "tab <surface>" for each tab's first terminal, then "split
+# <surface> <beside> <right|down>" for the others. Terminals gone are left
+# out of their tab's tree; those in no tab are not listed.
+function layout_plan() {
+    local layout="$1"
+    shift
+    [ -s "$layout" ] && command -v jq >/dev/null || return 0
+    jq -r '
+        def keep: if .s then (if (.s | IN($ARGS.positional[])) then . else null end)
+            else (.l | keep) as $l | (.r | keep) as $r
+                | if $l and $r then {d, l: $l, r: $r} else ($l // $r) end end;
+        def lead: if .s then .s else .l | lead end;
+        def steps: if .s then empty
+            else "split \(.r | lead) \(.l | lead) \(.d)", (.l | steps), (.r | steps) end;
+        .tabs[]? | keep | select(. != null) | "tab \(lead)", steps' "$layout" --args "$@" 2>/dev/null
+}
+
+# Opens the "<surface>\t<folder>\t<command>" lines on stdin, each in a
+# tab of its own, but the terminals that shared a tab before (the layout
+# file says which) as splits of one tab again.
+function open_items() {
+    local layout="$1"
+    local items surfaces opened="" n=0
+    items=$(grep .)
+    [ -z "$items" ] && return 0
+    surfaces=$(cut -f1 <<<"$items" | grep -vx -- -)
+    local step surface beside direction line cwd cmd new to
+    while read -r step surface beside direction; do
+        line=$(awk -F'\t' -v s="$surface" '$1 == s { print; exit }' <<<"$items")
+        [ -z "$line" ] && continue
+        IFS=$'\t' read -r _ cwd cmd <<<"$line"
+        new=""
+        if [ "$step" = split ]; then
+            to=$(awk -v s="$beside" '$1 == s { print $2; exit }' <<<"$opened")
+            [ -n "$to" ] && new=$("$OPENER" --print-terminal --split "$to" --direction "$direction" --command "$cmd" "$cwd" 2>>"$LOG")
+            [ -z "$new" ] && log "$(basename "$cwd"): could not split it beside the terminal it was beside; opening a tab"
+        fi
+        [ -z "$new" ] && new=$("$OPENER" --print-terminal --command "$cmd" "$cwd" 2>>"$LOG")
+        [ -z "$new" ] && log "$(basename "$cwd"): opening the tab failed"
+        opened+="$surface ${new:--}"$'\n'
+        n=$((n + 1))
+    done < <(layout_plan "$layout" $surfaces)
+    [ "$n" -gt 0 ] && log "put back $n terminal(s) of split tabs"
+    # The rest, a tab each, all in one go: a tab at a time took seconds each.
+    local tabs=""
+    while IFS=$'\t' read -r surface cwd cmd; do
+        [ "$surface" != - ] && grep -q "^$surface " <<<"$opened" && continue
+        tabs+="$cmd"$'\t'"$cwd"$'\n'
+    done <<<"$items"
+    [ -n "$tabs" ] || return 0
+    printf '%s' "$tabs" | "$OPENER" --batch >>"$LOG" 2>&1 || log "opening some tabs failed"
     return 0
 }
 
@@ -340,10 +520,13 @@ function reopen_missing() {
 }
 
 # Opens the sessions not already running, then checks they started. The
-# second argument lists ids already back in a holder.
+# second argument lists ids already back in a holder; the third, holders
+# to reattach with them (held_items), so a tab split between the two kinds
+# comes back as one.
 function reopen_all() {
     local sessions="$1"
     local held="${2:-}"
+    local reattach="${3:-}"
     local cwd sid flags todo=""
     while IFS=$'\t' read -r cwd sid flags; do
         [ -z "$sid" ] || [ ! -d "$cwd" ] && continue
@@ -351,7 +534,11 @@ function reopen_all() {
         grep -qxF "$sid" <<<"$held" && continue
         todo+="$cwd"$'\t'"$sid"$'\t'"$flags"$'\n'
     done <<<"$sessions"
-    [ -n "$todo" ] && resume_all "$todo"
+    if [ -n "$todo" ]; then
+        resume_all "$todo" "$reattach" "$LAYOUT"
+    else
+        open_items "$LAYOUT" <<<"$reattach"
+    fi
 }
 
 # What a failed reopen usually comes down to, for the log.
@@ -377,19 +564,19 @@ function wait_for_display() {
     sleep 5
 }
 
-# Opens a tab resuming each session, then checks they started, tries the
-# missing ones once more and records any still missing in $MISSING.
+# Opens a tab resuming each session, with the holders to reattach (the
+# second argument, held_items) and in the splits the layout file (the
+# third) records, then checks they started, tries the missing ones once
+# more and records any still missing in $MISSING.
 function resume_all() {
     local sessions="$1"
+    local reattach="${2:-}"
+    local layout="${3:-$LAYOUT}"
     local cwd sid flags
     while IFS=$'\t' read -r cwd sid flags; do
-        [ -z "$sid" ] && continue
-        # Once only: never a second tab on a session already back.
-        running_anywhere "$sid" && continue
-        log "resuming $(basename "$cwd")"
-        "$OPENER" --command "caffeinate -i claude --resume $sid $flags" "$cwd" >>"$LOG" 2>&1 \
-            || log "$(basename "$cwd"): opening the tab failed"
+        [ -n "$sid" ] && log "resuming $(basename "$cwd")"
     done <<<"$sessions"
+    printf '%s\n%s\n' "$reattach" "$(session_items "$sessions")" | open_items "$layout"
     sleep 20
     while IFS=$'\t' read -r cwd sid flags; do
         [ -z "$sid" ] && continue
@@ -460,6 +647,9 @@ function restart() {
     status quitting
     # The holders keep their tabs' programs running rather than hang them up.
     mkdir -p "$STATE_DIR/hold" && echo "$pid" >"$STATE_DIR/hold/quitting"
+    # Before any of its terminals close: the app may record the splits again
+    # as the sessions end.
+    cp -f "$LAYOUT" "$LAYOUT_KEPT" 2>/dev/null || rm -f "$LAYOUT_KEPT"
     # Claude saves its session as it ends; held ones are not ended, so
     # with none to end there is nothing to wait for.
     local ended=0
@@ -475,9 +665,15 @@ function restart() {
 
     # The opener starts the app with window-save-state=never, so it comes up
     # with only these tabs.
-    reattach_all
-    [ -n "$sessions" ] && resume_all "$sessions"
-    rm -f "$RESTARTING"
+    local reattach
+    reattach=$(held_items)
+    [ -n "$reattach" ] && log "reattaching $(grep -c . <<<"$reattach") terminal(s)"
+    if [ -n "$sessions" ]; then
+        resume_all "$sessions" "$reattach" "$LAYOUT_KEPT"
+    else
+        open_items "$LAYOUT_KEPT" <<<"$reattach"
+    fi
+    rm -f "$RESTARTING" "$LAYOUT_KEPT"
     log "done"
 }
 
@@ -504,6 +700,12 @@ function main() {
             mkdir -p "$STATE_DIR" || exit 1
             [ -x "$OPENER" ] || { echo "Error: $OPENER missing, run install.sh" >&2; exit 1; }
             reopen_missing
+            exit 0
+            ;;
+        --reattach)
+            mkdir -p "$STATE_DIR" || exit 1
+            [ -x "$OPENER" ] || { echo "Error: $OPENER missing, run install.sh" >&2; exit 1; }
+            reattach
             exit 0
             ;;
         --restore)

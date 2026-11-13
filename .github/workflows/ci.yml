@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash tests/hook-test.sh
+      - run: bash tests/browser-tools-test.sh
+      - run: bash tests/restart-test.sh
 
   patch:
     name: Patch applies to Ghostty
@@ -38,3 +40,5 @@ jobs:
         run: swift test --package-path tests/dock-logic
       - name: DockCore
         run: swift test
+      - name: File viewer page
+        run: bash tests/viewer-test.sh
