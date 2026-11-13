@@ -6084,10 +6084,10 @@ index 0000000..bc033d2
 +}
 diff --git a/macos/Sources/Features/Dock/DockOrdering.swift b/macos/Sources/Features/Dock/DockOrdering.swift
 new file mode 100644
-index 0000000..3b10b65
+index 0000000..8429ba3
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockOrdering.swift
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,275 @@
 +import Foundation
 +
 +/// What a tab is doing. Raw values are the urgency order: needs you first.
@@ -6182,6 +6182,9 @@ index 0000000..3b10b65
 +        case tabs
 +        /// As you dragged them.
 +        case manual
++        /// Pinned rows as you dragged them, then shells, needs you, running
++        /// (latest activity first), then finished or idle (latest stop first).
++        case activity
 +
 +        var label: String {
 +            switch self {
@@ -6190,6 +6193,7 @@ index 0000000..3b10b65
 +            case .runningFirst: return "Running first, then needs you, then recently idle"
 +            case .tabs: return "Tab order"
 +            case .manual: return "As you drag them"
++            case .activity: return "Activity: shells, needs you, then most recently active"
 +            }
 +        }
 +    }
@@ -6216,6 +6220,8 @@ index 0000000..3b10b65
 +        /// Window (first seen) and tab index, for tab order and ties.
 +        var place: [Int]
 +        var pinned = false
++        /// The session's latest prompt, tool call or stop.
++        var activity: Date? = nil
 +    }
 +
 +    /// Pinned rows first, then by the chosen order. `manual` is the keys in
@@ -6252,9 +6258,47 @@ index 0000000..3b10b65
 +                }
 +            case .tabs:
 +                break
++            case .activity:
++                if a.pinned {
++                    switch (manualIndex[a.key], manualIndex[b.key]) {
++                    case let (i?, j?) where i != j: return i < j
++                    case (_?, nil): return true
++                    case (nil, _?): return false
++                    default: break
++                    }
++                } else {
++                    let sa = section(a.status), sb = section(b.status)
++                    if sa != sb { return sa < sb }
++                    let da = a.status == .running ? a.activity ?? a.since : a.since
++                    let db = b.status == .running ? b.activity ?? b.since : b.since
++                    switch (da, db) {
++                    case let (s?, t?) where s != t: return s > t
++                    case (_?, nil): return true
++                    case (nil, _?): return false
++                    default: break
++                    }
++                }
 +            }
 +            return a.place.lexicographicallyPrecedes(b.place)
 +        }.map(\.item)
++    }
++
++    /// Activity order's sections: shells, needs you, running, then finished or idle.
++    private static func section(_ s: DockStatus) -> Int {
++        switch s {
++        case .shell: return 0
++        case .waiting: return 1
++        case .running: return 2
++        case .unread, .idle: return 3
++        }
++    }
++
++    /// `items` in the order of `previous` (keys), new ones after in their
++    /// own order, so rows hold still while the pointer is over them.
++    static func held<T>(_ items: [T], previous: [String], key: (T) -> String) -> [T] {
++        let index = Dictionary(previous.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
++        let known = items.filter { index[key($0)] != nil }.sorted { index[key($0)]! < index[key($1)]! }
++        return known + items.filter { index[key($0)] == nil }
 +    }
 +
 +    /// The hand-made order after dragging `key` to just before `target`

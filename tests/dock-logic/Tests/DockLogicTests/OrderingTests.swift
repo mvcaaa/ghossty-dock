@@ -3,7 +3,8 @@ import XCTest
 
 final class OrderingTests: XCTestCase {
     struct R { var key: String; var name: String; var status: DockStatus; var since: Double? = nil
-        var place: [Int]; var pinned = false; var folder: String? = nil; var tag: DockTag? = nil }
+        var place: [Int]; var pinned = false; var folder: String? = nil; var tag: DockTag? = nil
+        var activity: Double? = nil }
 
     let rows = [
         R(key: "a", name: "zeta", status: .running, place: [0, 0]),
@@ -15,7 +16,8 @@ final class OrderingTests: XCTestCase {
     func keys(_ order: DockOrdering.Order, _ rows: [R], manual: [String] = []) -> [String] {
         DockOrdering.sorted(rows, order: order, manual: manual) {
             DockOrdering.Facts(key: $0.key, name: $0.name, status: $0.status,
-                               since: $0.since.map(Date.init(timeIntervalSince1970:)), place: $0.place, pinned: $0.pinned)
+                               since: $0.since.map(Date.init(timeIntervalSince1970:)), place: $0.place, pinned: $0.pinned,
+                               activity: $0.activity.map(Date.init(timeIntervalSince1970:)))
         }.map(\.key)
     }
 
@@ -33,6 +35,50 @@ final class OrderingTests: XCTestCase {
 
     func testManualOrderThenUnknownInTabOrder() {
         XCTAssertEqual(keys(.manual, rows, manual: ["c", "a"]), ["c", "a", "b", "d"])
+    }
+
+    func testActivityOrder() {
+        let r = [
+            R(key: "run-old", name: "a", status: .running, since: 10, place: [0, 0], activity: 50),
+            R(key: "idle-old", name: "b", status: .idle, since: 100, place: [0, 1]),
+            R(key: "sh", name: "c", status: .shell, place: [0, 2]),
+            R(key: "ask", name: "d", status: .waiting, since: 5, place: [0, 3]),
+            R(key: "run-new", name: "e", status: .running, since: 20, place: [0, 4], activity: 90),
+            R(key: "done-new", name: "f", status: .unread, since: 300, place: [0, 5]),
+        ]
+        XCTAssertEqual(keys(.activity, r), ["sh", "ask", "run-new", "run-old", "done-new", "idle-old"])
+    }
+
+    func testActivityFallsBackToSince() {
+        let r = [R(key: "x", name: "x", status: .running, since: 10, place: [0, 0]),
+                 R(key: "y", name: "y", status: .running, since: 30, place: [0, 1])]
+        XCTAssertEqual(keys(.activity, r), ["y", "x"])
+    }
+
+    func testActivityTiesKeepTabOrder() {
+        let r = [R(key: "x", name: "x", status: .running, place: [0, 1], activity: 5),
+                 R(key: "y", name: "y", status: .running, place: [0, 0], activity: 5)]
+        XCTAssertEqual(keys(.activity, r), ["y", "x"])
+    }
+
+    func testActivityPinnedInManualOrderBeatStatus() {
+        var r = rows
+        r[1].pinned = true; r[3].pinned = true
+        XCTAssertEqual(Array(keys(.activity, r, manual: ["d", "b"]).prefix(2)), ["d", "b"])
+    }
+
+    func testActivityPinnedBeatStatus() {
+        let r = [R(key: "sh", name: "s", status: .shell, place: [0, 0]),
+                 R(key: "p", name: "p", status: .idle, place: [0, 1], pinned: true)]
+        XCTAssertEqual(keys(.activity, r), ["p", "sh"])
+    }
+
+    func testHeldKeepsPreviousOrder() {
+        XCTAssertEqual(DockOrdering.held(["a", "b", "c"], previous: ["c", "a", "b"], key: { $0 }), ["c", "a", "b"])
+    }
+
+    func testHeldDropsGoneAppendsNew() {
+        XCTAssertEqual(DockOrdering.held(["a", "n", "c"], previous: ["c", "gone", "a"], key: { $0 }), ["c", "a", "n"])
     }
 
     func testMoveStartsFromWhatIsShown() {
