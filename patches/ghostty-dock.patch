@@ -7765,10 +7765,10 @@ index 0000000..764cc07
 +}
 diff --git a/macos/Sources/Features/Dock/DockSessions.swift b/macos/Sources/Features/Dock/DockSessions.swift
 new file mode 100644
-index 0000000..cb11b6a
+index 0000000..b613e51
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSessions.swift
-@@ -0,0 +1,1879 @@
+@@ -0,0 +1,1895 @@
 +import AppKit
 +import Combine
 +import UserNotifications
@@ -7797,6 +7797,8 @@ index 0000000..cb11b6a
 +        var detail: String
 +        var status: Status
 +        var since: Date?
++        /// Its session's latest prompt, tool call or stop, for the Activity sort.
++        var activity: Date?
 +        var selected: Bool
 +        /// The Claude Code session in it, if any: what Undock moves.
 +        var sessionId: String?
@@ -8014,6 +8016,14 @@ index 0000000..cb11b6a
 +    private var moveTimer: Timer?
 +    private var watcher: DispatchSourceFileSystemObject?
 +    private var jumpKey: DockHotKey?
++    /// While the pointer is over the sidebar the Activity order holds still;
++    /// leaving applies the current one.
++    var holdOrder = false {
++        didSet { if oldValue && !holdOrder { refresh() } }
++    }
++    /// The row order last shown, which a held order keeps.
++    private var heldKeys: [String] = []
++
 +    /// First-seen order of tabs, so rows keep their place within a status group.
 +    private var order: [ObjectIdentifier] = []
 +
@@ -8499,6 +8509,7 @@ index 0000000..cb11b6a
 +        var prompt: String?
 +        var ask: DockAsk?
 +        var transcript: String?
++        var updated: Int?
 +    }
 +
 +    private var titles: [String: DockTitles] = [:]
@@ -8832,7 +8843,7 @@ index 0000000..cb11b6a
 +
 +            // A tab with splits is one row: its most urgent session.
 +            var best: (status: Status, since: Int, name: String, key: String, sid: String?,
-+                       project: String?, prompt: String?, pid: Int32?, ask: DockAsk?)?
++                       project: String?, prompt: String?, pid: Int32?, ask: DockAsk?, updated: Int?)?
 +            var own: Session?
 +            for surface in controller.surfaceTree {
 +                let key = surface.id.uuidString
@@ -8842,7 +8853,7 @@ index 0000000..cb11b6a
 +                    let name = DockTitles.ownName(titles(s.transcript), title: title,
 +                                                  focused: surface === focused, fallback: s.name)
 +                    best = (status, s.since, name, key, s.session_id.flatMap { $0.isEmpty ? nil : $0 },
-+                            s.project, s.prompt, s.claude_pid, s.ask)
++                            s.project, s.prompt, s.claude_pid, s.ask, s.updated)
 +                    own = s
 +                }
 +            }
@@ -8856,7 +8867,7 @@ index 0000000..cb11b6a
 +               let sid = s.session_id, !sid.isEmpty, let focused {
 +                let name = titles(s.transcript)?.chosen ?? title
 +                best = (status(of: s, seenKey: "sid-" + sid), s.since, name, focused.id.uuidString, sid,
-+                        s.project, s.prompt, s.claude_pid, s.ask)
++                        s.project, s.prompt, s.claude_pid, s.ask, s.updated)
 +            }
 +            let pwd = focused?.pwd ?? (failed ? focused?.startConfig?.workingDirectory : nil) ?? ""
 +            let name = best?.name.isEmpty == false ? best!.name
@@ -8885,6 +8896,7 @@ index 0000000..cb11b6a
 +                             name: m?.name ?? (name.isEmpty ? "shell" : name), detail: pwd,
 +                             status: status,
 +                             since: best.map { Date(timeIntervalSince1970: TimeInterval($0.since)) },
++                             activity: best?.updated.map { Date(timeIntervalSince1970: TimeInterval($0)) },
 +                             selected: selected,
 +                             sessionId: best?.sid,
 +                             started: best?.sid.flatMap(started),
@@ -8925,8 +8937,12 @@ index 0000000..cb11b6a
 +        built = DockOrdering.sorted(built, order: DockSettings.order, manual: DockSettings.manualOrder) { r in
 +            let p = place(r)
 +            return DockOrdering.Facts(key: r.key, name: r.name, status: r.status, since: r.since,
-+                                      place: [p.0, p.1], pinned: r.pinned)
++                                      place: [p.0, p.1], pinned: r.pinned, activity: r.activity)
 +        }
++        if holdOrder, DockSettings.order == .activity {
++            built = DockOrdering.held(built, previous: heldKeys, key: \.key)
++        }
++        heldKeys = built.map(\.key)
 +        for row in built where closeWhenEmpty[row.id] != nil {
 +            if row.status == .shell {
 +                closeWhenEmpty[row.id] = nil
@@ -10252,10 +10268,10 @@ index 0000000..ea8091f
 +}
 diff --git a/macos/Sources/Features/Dock/DockSidebarView.swift b/macos/Sources/Features/Dock/DockSidebarView.swift
 new file mode 100644
-index 0000000..fc90caf
+index 0000000..afce260
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSidebarView.swift
-@@ -0,0 +1,1688 @@
+@@ -0,0 +1,1689 @@
 +import AppKit
 +import SwiftUI
 +import UniformTypeIdentifiers
@@ -10382,6 +10398,7 @@ index 0000000..fc90caf
 +                .padding(.horizontal, 6)
 +                .padding(.vertical, 4)
 +            }
++            .onHover { model.holdOrder = $0 }
 +            DockHistoryPanel()
 +        }
 +        .frame(width: CGFloat(width.clamped(to: Self.widthRange)))
