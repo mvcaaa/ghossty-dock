@@ -6084,10 +6084,10 @@ index 0000000..bc033d2
 +}
 diff --git a/macos/Sources/Features/Dock/DockOrdering.swift b/macos/Sources/Features/Dock/DockOrdering.swift
 new file mode 100644
-index 0000000..8429ba3
+index 0000000..5f4e71c
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockOrdering.swift
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,285 @@
 +import Foundation
 +
 +/// What a tab is doing. Raw values are the urgency order: needs you first.
@@ -6281,6 +6281,16 @@ index 0000000..8429ba3
 +            }
 +            return a.place.lexicographicallyPrecedes(b.place)
 +        }.map(\.item)
++    }
++
++    /// What a drag does in the Activity order, where activity places the
++    /// unpinned rows: only the pinned block takes drops.
++    enum Drop { case reorder, pinAndReorder, ignore }
++
++    /// `targetPinned` is nil for a drop at the end of the list.
++    static func activityDrop(keyPinned: Bool, targetPinned: Bool?) -> Drop {
++        guard targetPinned == true else { return .ignore }
++        return keyPinned ? .reorder : .pinAndReorder
 +    }
 +
 +    /// Activity order's sections: shells, needs you, running, then finished or idle.
@@ -7765,10 +7775,10 @@ index 0000000..764cc07
 +}
 diff --git a/macos/Sources/Features/Dock/DockSessions.swift b/macos/Sources/Features/Dock/DockSessions.swift
 new file mode 100644
-index 0000000..b613e51
+index 0000000..7572927
 --- /dev/null
 +++ b/macos/Sources/Features/Dock/DockSessions.swift
-@@ -0,0 +1,1895 @@
+@@ -0,0 +1,1907 @@
 +import AppKit
 +import Combine
 +import UserNotifications
@@ -9017,6 +9027,7 @@ index 0000000..b613e51
 +        if let data = try? JSONEncoder().encode(meta) {
 +            UserDefaults.standard.set(data, forKey: DockSettings.rowMetaKey)
 +        }
++        heldKeys = []
 +        refresh()
 +    }
 +
@@ -9276,12 +9287,23 @@ index 0000000..b613e51
 +    /// switches the sidebar to the order you drag.
 +    func move(_ key: String, before target: String?) {
 +        guard key != target else { return }
++        var pin: Row?
++        if DockSettings.order == .activity {
++            guard let row = rows.first(where: { $0.key == key }) else { return }
++            let targetPinned = target.flatMap { t in rows.first { $0.key == t }?.pinned }
++            switch DockOrdering.activityDrop(keyPinned: row.pinned, targetPinned: targetPinned) {
++            case .ignore: return
++            case .pinAndReorder: pin = row
++            case .reorder: break
++            }
++        }
 +        let list = DockOrdering.move(key, before: target, visible: rows.map(\.key), manual: DockSettings.manualOrder)
 +        UserDefaults.standard.set(list, forKey: DockSettings.manualOrderKey)
-+        if DockSettings.order != .manual {
++        if DockSettings.order != .manual && DockSettings.order != .activity {
 +            UserDefaults.standard.set(DockOrdering.Order.manual.rawValue, forKey: DockSettings.orderKey)
 +        }
-+        refresh()
++        heldKeys = []
++        if let pin { setMeta(pin) { $0.pinned = true } } else { refresh() }
 +    }
 +
 +    /// Move Up / Move Down from the row's menu: one place in the sidebar.

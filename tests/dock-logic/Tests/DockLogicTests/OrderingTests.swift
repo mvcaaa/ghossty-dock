@@ -81,6 +81,14 @@ final class OrderingTests: XCTestCase {
         XCTAssertEqual(DockOrdering.held(["a", "n", "c"], previous: ["c", "gone", "a"], key: { $0 }), ["c", "a", "n"])
     }
 
+    func testActivityDropRules() {
+        XCTAssertEqual(DockOrdering.activityDrop(keyPinned: true, targetPinned: true), .reorder)
+        XCTAssertEqual(DockOrdering.activityDrop(keyPinned: false, targetPinned: true), .pinAndReorder)
+        XCTAssertEqual(DockOrdering.activityDrop(keyPinned: false, targetPinned: false), .ignore)
+        XCTAssertEqual(DockOrdering.activityDrop(keyPinned: true, targetPinned: false), .ignore)
+        XCTAssertEqual(DockOrdering.activityDrop(keyPinned: true, targetPinned: nil), .ignore)
+    }
+
     func testMoveStartsFromWhatIsShown() {
         let moved = DockOrdering.move("d", before: "b", visible: ["b", "d", "c", "a"], manual: [])
         XCTAssertEqual(moved, ["d", "b", "c", "a"])
